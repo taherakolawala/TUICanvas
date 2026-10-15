@@ -1,0 +1,8 @@
+benchmarks/private/
+__pycache__/
+*.har
+.venv/
+.tools/
+target/
+*.session.dpapi
+
