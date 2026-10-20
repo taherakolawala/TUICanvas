@@ -11,6 +11,7 @@ mod model;
 mod protect;
 mod session;
 mod smoke;
+mod theme;
 mod transport;
 mod tui;
 mod ui;

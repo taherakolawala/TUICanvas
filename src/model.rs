@@ -110,6 +110,9 @@ pub struct AssignmentSummary {
     pub locked_for_user: Option<bool>,
     #[serde(default)]
     pub submission: Option<Submission>,
+    /// Course-defined order; Canvas uses it to order assignments with equal due dates.
+    #[serde(default)]
+    pub position: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -129,6 +132,8 @@ pub struct AssignmentDetail {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Good,
+    /// Action still open, not yet late.
+    Info,
     Warn,
     Bad,
     Neutral,
@@ -185,7 +190,7 @@ impl AssignmentSummary {
         }
         match self.due_at {
             Some(due) if due < now => ("Not submitted (past due)".into(), Tone::Bad),
-            _ => ("Not submitted".into(), Tone::Warn),
+            _ => ("Not submitted".into(), Tone::Info),
         }
     }
 }

@@ -1,28 +1,20 @@
 //! Rendering. Only visible rows are built; description text is wrapped once
-//! per assignment version and width.
+//! per assignment version and width, and styled only for the visible lines.
 
 use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, DetailRender, Origin, Resource, SyncState, ViewKind};
 use crate::html;
-use crate::model::{AssignmentDetail, Tone, fmt_num};
+use crate::model::{AssignmentDetail, AssignmentSummary, Tone, fmt_num};
+use crate::theme;
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-
-fn tone_style(tone: Tone) -> Style {
-    match tone {
-        Tone::Good => Style::new().fg(Color::Green),
-        Tone::Warn => Style::new().fg(Color::Yellow),
-        Tone::Bad => Style::new().fg(Color::Red),
-        Tone::Neutral => Style::new().fg(Color::Gray),
-    }
-}
 
 pub fn truncate(text: &str, width: usize) -> String {
     if text.width() <= width {
@@ -100,6 +92,11 @@ fn submission_type(t: &str) -> &str {
     }
 }
 
+/// Finished or not actionable: deadlines for these recede instead of alarming.
+fn done(a: &AssignmentSummary, now: DateTime<Utc>) -> bool {
+    matches!(a.status(now).1, Tone::Good | Tone::Neutral)
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let now = Utc::now();
     let [top, main, bottom] = Layout::vertical([
@@ -145,7 +142,7 @@ fn sync_text<T>(res: Option<&Resource<T>>, spinner: usize, now: DateTime<Utc>) -
             };
             (
                 format!("{} Syncing…{saved}", SPINNER[spinner % SPINNER.len()]),
-                Style::new().fg(Color::Black).bg(Color::Yellow),
+                theme::syncing(),
             )
         }
         SyncState::Failed(e) => {
@@ -157,17 +154,17 @@ fn sync_text<T>(res: Option<&Resource<T>>, spinner: usize, now: DateTime<Utc>) -
             };
             (
                 format!("! {what}: {} · {hint}", e.describe()),
-                Style::new().fg(Color::White).bg(Color::Red),
+                theme::failed(),
             )
         }
         SyncState::Idle => match (res.origin, res.fetched_at) {
             (Origin::Network, Some(at)) => (
                 format!("Updated {}", at.with_timezone(&Local).format("%-I:%M %p")),
-                Style::new().fg(Color::Black).bg(Color::Green),
+                theme::updated(),
             ),
             (Origin::Cache, Some(at)) => (
                 format!("Saved copy from {}", age(at, now)),
-                Style::new().fg(Color::Black).bg(Color::Yellow),
+                theme::syncing(),
             ),
             _ => (String::new(), Style::new()),
         },
@@ -202,48 +199,110 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     };
     let width = usize::from(area.width);
     let status = truncate(&status, width.saturating_sub(12).max(10));
-    let status_w = status.width() + 2;
-    let left = truncate(&crumbs.join(" › "), width.saturating_sub(status_w + 1));
-    let fill = width.saturating_sub(left.width() + status_w);
-    let line = Line::from(vec![
-        Span::styled(left, Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(fill)),
-        Span::styled(format!(" {status} "), style),
-    ]);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::new().bg(Color::DarkGray).fg(Color::White)),
-        area,
-    );
+    let status_w = if status.is_empty() {
+        0
+    } else {
+        status.width() + 2
+    };
+    // Breadcrumb: earlier levels dim, current level bold, orange separators.
+    let budget = width.saturating_sub(status_w + 2);
+    let mut spans = vec![Span::styled(" ", theme::bar())];
+    let mut used = 1;
+    let last = crumbs.len() - 1;
+    for (i, crumb) in crumbs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" › ", theme::bar_separator()));
+            used += 3;
+        }
+        let room = budget.saturating_sub(used);
+        let text = truncate(crumb, room.max(1));
+        used += text.width();
+        let style = if i == last {
+            theme::bar().add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            theme::bar_dim()
+        };
+        spans.push(Span::styled(text, style));
+        if used >= budget {
+            break;
+        }
+    }
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used + status_w)),
+        theme::bar(),
+    ));
+    if !status.is_empty() {
+        spans.push(Span::styled(format!(" {status} "), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::bar()), area);
+}
+
+fn hint_spans(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(key.to_string(), theme::key()));
+        spans.push(Span::styled(format!(" {label}"), theme::muted()));
+    }
+    spans
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let view = app.view();
-    let (left, style) = if view.filtering {
-        (
-            format!("/{}▏  Enter keep · Esc clear", view.filter),
-            Style::new().fg(Color::Cyan),
-        )
+    let left: Vec<Span> = if view.filtering {
+        vec![
+            Span::styled("/", theme::key()),
+            Span::styled(view.filter.clone(), theme::bold()),
+            Span::styled("▏", theme::key()),
+            Span::raw("  "),
+        ]
+        .into_iter()
+        .chain(hint_spans(&[("Enter", "keep"), ("Esc", "clear")]))
+        .collect()
     } else if app.login_required {
-        (
-            "Signed out or session expired — press L to sign in".to_string(),
-            Style::new().fg(Color::Black).bg(Color::Yellow),
-        )
+        vec![Span::styled(
+            " Signed out or session expired — press L to sign in ",
+            theme::alert(),
+        )]
     } else if let Some(notice) = &app.notice {
-        (notice.clone(), Style::new().fg(Color::Cyan))
+        vec![Span::styled(notice.clone(), theme::notice())]
     } else {
-        let hints = match view.kind {
-            ViewKind::Courses => "↑↓ move  Enter open  / filter  r refresh  o browser  q quit",
-            ViewKind::Assignments { .. } => {
-                "↑↓ move  Enter open  Esc back  / filter  r refresh  o browser  q quit"
-            }
-            ViewKind::Detail { .. } => "↑↓ scroll  Esc back  r refresh  o open in browser  q quit",
+        let hints: &[(&str, &str)] = match view.kind {
+            ViewKind::Courses => &[
+                ("↑↓", "move"),
+                ("Enter", "open"),
+                ("/", "filter"),
+                ("r", "refresh"),
+                ("o", "browser"),
+                ("q", "quit"),
+            ],
+            ViewKind::Assignments { .. } => &[
+                ("↑↓", "move"),
+                ("Enter", "open"),
+                ("Esc", "back"),
+                ("/", "filter"),
+                ("r", "refresh"),
+                ("o", "browser"),
+                ("q", "quit"),
+            ],
+            ViewKind::Detail { .. } => &[
+                ("↑↓", "scroll"),
+                ("Esc", "back"),
+                ("r", "refresh"),
+                ("o", "open in browser"),
+                ("q", "quit"),
+            ],
         };
-        let filter = if view.filter.is_empty() {
-            String::new()
-        } else {
-            format!("[filter: {}]  ", view.filter)
-        };
-        (format!("{filter}{hints}"), Style::new().fg(Color::Gray))
+        let mut spans = Vec::new();
+        if !view.filter.is_empty() {
+            spans.push(Span::styled("filter ", theme::muted()));
+            spans.push(Span::styled(view.filter.clone(), theme::code()));
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(hint_spans(hints));
+        spans
     };
     let stats = app
         .last_stats
@@ -258,40 +317,40 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or_default();
     let width = usize::from(area.width);
-    let stats = if stats.width() + 20 < width {
+    let left_w: usize = left.iter().map(|s| s.content.width()).sum();
+    let stats = if left_w + stats.width() + 2 <= width {
         stats
     } else {
         String::new()
     };
-    let left = truncate(&left, width.saturating_sub(stats.width() + 1));
-    let fill = width.saturating_sub(left.width() + stats.width());
-    let line = Line::from(vec![
-        Span::styled(left, style),
-        Span::raw(" ".repeat(fill)),
-        Span::styled(stats, Style::new().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let fill = width.saturating_sub(left_w + stats.width());
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(fill)));
+    spans.push(Span::styled(stats, theme::faint()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn placeholder<T>(frame: &mut Frame, area: Rect, res: Option<&Resource<T>>, what: &str) -> bool {
-    let res_has_data = res.is_some_and(|r| r.data.is_some());
-    if res_has_data {
+    if res.is_some_and(|r| r.data.is_some()) {
         return false;
     }
     let lines: Vec<Line> = match res.map(|r| &r.sync) {
         Some(SyncState::Failed(e)) => vec![
             Line::styled(
                 format!("Could not load {what}: {}", e.describe()),
-                Style::new().fg(Color::Red),
+                theme::error(),
             ),
             Line::raw(""),
-            Line::raw(if e.needs_login() {
-                "Press L to sign in, or q to quit."
-            } else {
-                "Press r to retry."
-            }),
+            Line::styled(
+                if e.needs_login() {
+                    "Press L to sign in, or q to quit."
+                } else {
+                    "Press r to retry."
+                },
+                theme::muted(),
+            ),
         ],
-        _ => vec![Line::raw(format!("Loading {what}…"))],
+        _ => vec![Line::styled(format!("Loading {what}…"), theme::muted())],
     };
     let y = area.y + area.height / 3;
     let target = Rect {
@@ -310,7 +369,7 @@ fn empty_message(frame: &mut Frame, area: Rect, filter: &str, what: &str) {
         format!("No {what} match “{filter}”.")
     };
     frame.render_widget(
-        Paragraph::new(text).alignment(Alignment::Center),
+        Paragraph::new(Line::styled(text, theme::muted())).alignment(Alignment::Center),
         Rect {
             y: area.y + area.height / 3,
             height: 1,
@@ -332,13 +391,6 @@ fn window(app: &mut App, rows: usize, height: usize) -> (usize, usize) {
     (view.offset, (view.offset + height).min(rows))
 }
 
-fn selected_style() -> Style {
-    Style::new()
-        .bg(Color::Blue)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD)
-}
-
 fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
     if placeholder(frame, area, Some(&app.courses), "courses") {
         return;
@@ -357,24 +409,25 @@ fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|(i, &index)| {
             let c = &courses[index];
             let row = Row::new(vec![
+                // ASCII: "★" is ambiguous-width and misaligns columns in some fonts.
                 Cell::from(if c.is_favorite == Some(true) {
-                    "★"
+                    "*"
                 } else {
                     " "
-                }),
+                })
+                .style(theme::favorite()),
                 Cell::from(c.title().to_string()),
-                Cell::from(c.course_code.clone().unwrap_or_default())
-                    .style(Style::new().fg(Color::Gray)),
+                Cell::from(c.course_code.clone().unwrap_or_default()).style(theme::code()),
                 Cell::from(
                     c.term
                         .as_ref()
                         .and_then(|t| t.name.clone())
                         .unwrap_or_default(),
                 )
-                .style(Style::new().fg(Color::DarkGray)),
+                .style(theme::faint()),
             ]);
             if start + i == selected {
-                row.style(selected_style())
+                row.style(theme::selected())
             } else {
                 row
             }
@@ -402,7 +455,7 @@ fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
         if wide { "Code" } else { "" },
         if wide { "Term" } else { "" },
     ])
-    .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
+    .style(theme::table_header());
     frame.render_widget(
         Table::new(built, widths).header(header).column_spacing(1),
         area,
@@ -442,17 +495,18 @@ fn draw_assignments(
                 .map(|d| short_date(d, now))
                 .unwrap_or_else(|| "No due date".into());
             let row = Row::new(vec![
-                Cell::from(due),
+                Cell::from(due).style(theme::due(a.due_at, done(a, now), now)),
                 Cell::from(a.title().to_string()),
-                Cell::from(status).style(tone_style(tone)),
+                Cell::from(status).style(theme::tone(tone)),
                 Cell::from(
                     a.points_possible
                         .map(|p| format!("{} pts", fmt_num(p)))
                         .unwrap_or_default(),
-                ),
+                )
+                .style(theme::muted()),
             ]);
             if start + i == selected {
-                row.style(selected_style())
+                row.style(theme::selected())
             } else {
                 row
             }
@@ -480,8 +534,8 @@ fn draw_assignments(
             Constraint::Length(0),
         ]
     };
-    let header = Row::new(vec!["Due", "Assignment", "Status", "Points"])
-        .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
+    let header =
+        Row::new(vec!["Due", "Assignment", "Status", "Points"]).style(theme::table_header());
     frame.render_widget(
         Table::new(built, widths).header(header).column_spacing(1),
         area,
@@ -490,30 +544,24 @@ fn draw_assignments(
 
 fn detail_header(d: &AssignmentDetail, course: &str, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let a = &d.base;
-    let label = |s: &str| Span::styled(format!("{s:<12}"), Style::new().fg(Color::Gray));
+    let label = |s: &str| Span::styled(format!("{s:<12}"), theme::muted());
     let mut lines = vec![
-        Line::styled(
-            html::sanitize(a.title()),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
-        Line::from(vec![label("Course"), Span::raw(html::sanitize(course))]),
+        Line::styled(html::sanitize(a.title()), theme::heading()),
+        Line::from(vec![
+            label("Course"),
+            Span::styled(html::sanitize(course), theme::code()),
+        ]),
     ];
     let due = match a.due_at {
-        Some(due) => {
-            let style = if due < now {
-                Style::new().fg(Color::Red)
-            } else {
-                Style::new().fg(Color::Yellow)
-            };
-            Line::from(vec![
-                label("Due"),
-                Span::styled(
-                    format!("{} ({})", long_date(due), relative(due, now)),
-                    style,
-                ),
-            ])
-        }
-        None => Line::from(vec![label("Due"), Span::raw("No due date")]),
+        Some(due) => Line::from(vec![
+            label("Due"),
+            Span::styled(long_date(due), theme::due(Some(due), done(a, now), now)),
+            Span::styled(format!("  ({})", relative(due, now)), theme::muted()),
+        ]),
+        None => Line::from(vec![
+            label("Due"),
+            Span::styled("No due date", theme::faint()),
+        ]),
     };
     lines.push(due);
     if a.unlock_at.is_some() || a.lock_at.is_some() {
@@ -530,21 +578,27 @@ fn detail_header(d: &AssignmentDetail, course: &str, now: DateTime<Utc>) -> Vec<
         ]));
     }
     let (status, tone) = a.status(now);
-    let mut status_text = status;
+    let mut status_line = vec![label("Status"), Span::styled(status, theme::tone(tone))];
     if let Some(sub) = &a.submission {
         if let Some(at) = sub.submitted_at {
-            status_text.push_str(&format!(" · {}", short_date(at, now)));
+            status_line.push(Span::styled(
+                format!("  · submitted {}", short_date(at, now)),
+                theme::muted(),
+            ));
         }
         if sub.attempt.unwrap_or(0) > 1 {
-            status_text.push_str(&format!(" · attempt {}", sub.attempt.unwrap_or(0)));
+            status_line.push(Span::styled(
+                format!(" · attempt {}", sub.attempt.unwrap_or(0)),
+                theme::muted(),
+            ));
         }
     }
-    lines.push(Line::from(vec![
-        label("Status"),
-        Span::styled(status_text, tone_style(tone)),
-    ]));
+    lines.push(Line::from(status_line));
     if let Some(p) = a.points_possible {
-        lines.push(Line::from(vec![label("Points"), Span::raw(fmt_num(p))]));
+        lines.push(Line::from(vec![
+            label("Points"),
+            Span::styled(fmt_num(p), theme::bold()),
+        ]));
     }
     if !a.submission_types.is_empty() {
         let types: Vec<&str> = a
@@ -558,7 +612,8 @@ fn detail_header(d: &AssignmentDetail, course: &str, now: DateTime<Utc>) -> Vec<
         };
         lines.push(Line::from(vec![
             label("Submit via"),
-            Span::raw(format!("{}{attempts}", types.join(", "))),
+            Span::raw(types.join(", ")),
+            Span::styled(attempts, theme::muted()),
         ]));
     }
     if a.locked_for_user == Some(true) {
@@ -569,10 +624,109 @@ fn detail_header(d: &AssignmentDetail, course: &str, now: DateTime<Utc>) -> Vec<
             .unwrap_or_default();
         lines.push(Line::from(vec![
             label("Locked"),
-            Span::styled(why, Style::new().fg(Color::Red)),
+            Span::styled(why, theme::error()),
         ]));
     }
     lines
+}
+
+/// Inline markup produced by the HTML renderer: `**bold**` and `[text][n]` links.
+fn style_inline(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    let mut plain = String::new();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("**")
+            && let Some(end) = after.find("**")
+            && end > 0
+        {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base));
+            }
+            spans.push(Span::styled(
+                after[..end].to_string(),
+                base.add_modifier(ratatui::style::Modifier::BOLD),
+            ));
+            rest = &after[end + 2..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('[')
+            && let Some(close) = after.find("][")
+            && !after[..close].contains(['[', ']'])
+            && let Some(num_end) = after[close + 2..].find(']')
+            && after[close + 2..close + 2 + num_end]
+                .chars()
+                .all(|c| c.is_ascii_digit())
+            && num_end > 0
+        {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base));
+            }
+            spans.push(Span::styled(after[..close].to_string(), theme::link()));
+            spans.push(Span::styled(
+                after[close + 1..close + 3 + num_end].to_string(),
+                theme::faint(),
+            ));
+            rest = &after[close + 3 + num_end..];
+            continue;
+        }
+        let c = rest.chars().next().expect("non-empty");
+        plain.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    if !plain.is_empty() {
+        spans.push(Span::styled(plain, base));
+    }
+    spans
+}
+
+/// Colour one rendered description line: headings, list markers, link
+/// footnotes, table rules, inline bold and links.
+pub fn style_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    if let Some(level) = trimmed
+        .find(|c| c != '#')
+        .filter(|&n| n > 0 && trimmed[n..].starts_with(' '))
+    {
+        return Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(trimmed[level + 1..].to_string(), theme::heading()),
+        ]);
+    }
+    if trimmed.starts_with('[')
+        && let Some(close) = trimmed.find("]: ")
+        && trimmed[1..close].chars().all(|c| c.is_ascii_digit())
+    {
+        return Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(trimmed[..close + 3].to_string(), theme::faint()),
+            Span::styled(trimmed[close + 3..].to_string(), theme::link()),
+        ]);
+    }
+    if !trimmed.is_empty() && trimmed.chars().all(|c| "─│┬┴┼├┤┌┐└┘ ".contains(c))
+    {
+        return Line::styled(line.to_string(), theme::faint());
+    }
+    let marker_len = if trimmed.starts_with("* ") || trimmed.starts_with("- ") {
+        2
+    } else {
+        let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && trimmed[digits..].starts_with(". ") {
+            digits + 2
+        } else {
+            0
+        }
+    };
+    let mut spans = vec![Span::raw(indent.to_string())];
+    if marker_len > 0 {
+        spans.push(Span::styled(
+            trimmed[..marker_len].to_string(),
+            theme::accent(),
+        ));
+    }
+    spans.extend(style_inline(&trimmed[marker_len..], theme::text()));
+    Line::from(spans)
 }
 
 fn draw_detail(
@@ -609,22 +763,31 @@ fn draw_detail(
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "─".repeat(usize::from(text_width)),
-        Style::new().fg(Color::DarkGray),
+        theme::faint(),
     ));
+    let head_len = lines.len();
     let body = &app.detail_render.as_ref().expect("rendered").lines;
-    if body.is_empty() {
-        lines.push(Line::styled(
-            "(No description)",
-            Style::new().fg(Color::Gray),
-        ));
-    } else {
-        lines.extend(body.iter().map(|l| Line::raw(l.clone())));
-    }
+    let body_len = body.len().max(1);
     let height = usize::from(area.height);
-    let max_scroll = lines.len().saturating_sub(height);
+    let max_scroll = (head_len + body_len).saturating_sub(height);
     let view = app.stack.last_mut().expect("view");
     view.scroll = view.scroll.min(max_scroll);
-    let visible: Vec<Line> = lines.into_iter().skip(view.scroll).take(height).collect();
+    let scroll = view.scroll;
+    let mut visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+    let body_start = scroll.saturating_sub(head_len);
+    let room = height - visible.len();
+    if body.is_empty() {
+        if room > 0 && scroll <= head_len {
+            visible.push(Line::styled("(No description)", theme::muted()));
+        }
+    } else {
+        visible.extend(
+            body.iter()
+                .skip(body_start)
+                .take(room)
+                .map(|l| style_line(l)),
+        );
+    }
     let inner = Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(1),
@@ -680,6 +843,65 @@ mod tests {
             }
         }
         panic!("no fetch");
+    }
+
+    fn texts(line: &Line) -> Vec<String> {
+        line.spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn description_markup_is_styled_not_shown() {
+        let h = style_line("## Overview");
+        assert_eq!(texts(&h), ["Overview"]);
+        let l = style_line("Read the [Lab-2 slides][1] and **submit** [note] here.");
+        assert_eq!(
+            texts(&l),
+            [
+                "Read the ",
+                "Lab-2 slides",
+                "[1]",
+                " and ",
+                "submit",
+                " [note] here."
+            ]
+        );
+        assert_eq!(
+            l.spans
+                .iter()
+                .find(|s| s.content == "Lab-2 slides")
+                .unwrap()
+                .style,
+            theme::link()
+        );
+        let f = style_line("[1]: https://ufl.instructure.com/courses/1/files/2");
+        assert_eq!(
+            texts(&f),
+            ["[1]: ", "https://ufl.instructure.com/courses/1/files/2"]
+        );
+        let b = style_line("  12. Step");
+        assert_eq!(texts(&b), ["  ", "12. ", "Step"]);
+        assert_eq!(texts(&style_line("5 * 3 = 15")), ["5 * 3 = 15"]);
+        assert_eq!(texts(&style_line("a [x] b [y][z]")), ["a [x] b [y][z]"]);
+    }
+
+    #[test]
+    fn deadlines_colour_by_urgency() {
+        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            // Colours are deliberately off; urgency is still bold.
+            assert_eq!(theme::due(Some(Utc::now()), false, Utc::now()).fg, None);
+            return;
+        }
+        let now = Utc::now();
+        let hours = |h: i64| Some(now + chrono::Duration::hours(h));
+        assert_eq!(theme::due(hours(-2), false, now).fg, Some(theme::RED));
+        assert_eq!(theme::due(hours(5), false, now).fg, Some(theme::PEACH));
+        assert_eq!(theme::due(hours(48), false, now).fg, Some(theme::AMBER));
+        assert_eq!(theme::due(hours(24 * 10), false, now).fg, None);
+        assert_eq!(theme::due(hours(-2), true, now).fg, Some(theme::MUTED));
     }
 
     #[test]
@@ -786,5 +1008,200 @@ mod tests {
         // Narrow terminal still renders.
         let s = screen(&mut app, 40, 10);
         assert!(s.lines().count() == 10);
+    }
+}
+
+/// Writes colour previews of each screen as HTML when TUICANVAS_PREVIEW is set
+/// (development aid; run with `cargo test preview -- --ignored`).
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::app::{Effect, Msg, Payload};
+    use crate::canvas::FetchStats;
+    use crate::model::{AssignmentSummary, Course, Submission, Term};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::style::{Color, Modifier};
+
+    fn css(c: Color, default: &str) -> String {
+        match c {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Black => "#0c0c0c".into(),
+            Color::White => "#f2f2f2".into(),
+            Color::Gray => "#cccccc".into(),
+            Color::DarkGray => "#767676".into(),
+            Color::Red => "#c50f1f".into(),
+            Color::Green => "#13a10e".into(),
+            Color::Yellow => "#c19c00".into(),
+            Color::Blue => "#0037da".into(),
+            Color::Cyan => "#3a96dd".into(),
+            _ => default.into(),
+        }
+    }
+
+    fn html(app: &mut App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let b = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let cell = &b[(x, y)];
+                let mut fg = css(cell.fg, "#cccccc");
+                let mut bg = css(cell.bg, "#0c0c0c");
+                if cell.modifier.contains(Modifier::REVERSED) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                let weight = if cell.modifier.contains(Modifier::BOLD) {
+                    "bold"
+                } else {
+                    "normal"
+                };
+                let deco = if cell.modifier.contains(Modifier::UNDERLINED) {
+                    "underline"
+                } else {
+                    "none"
+                };
+                let sym = match cell.symbol() {
+                    "<" => "&lt;",
+                    ">" => "&gt;",
+                    "&" => "&amp;",
+                    s => s,
+                };
+                out.push_str(&format!("<span style=\"color:{fg};background:{bg};font-weight:{weight};text-decoration:{deco}\">{sym}</span>"));
+            }
+            out.push('\n');
+        }
+        format!(
+            "<pre style=\"font:14px/1.25 Cascadia Mono,Consolas,monospace;background:#0c0c0c;margin:0 0 18px;padding:6px;display:inline-block\">{out}</pre><br>"
+        )
+    }
+
+    fn deliver(app: &mut App, effects: Vec<Effect>, payload: Payload) {
+        for e in effects {
+            if let Effect::Fetch { key, request } = e {
+                app.update(Msg::Fetched {
+                    key,
+                    request,
+                    result: Ok((
+                        payload,
+                        FetchStats {
+                            requests: 1,
+                            bytes: 7_644,
+                            ms: 441.0,
+                        },
+                    )),
+                    at: Utc::now(),
+                });
+                return;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn preview() {
+        let Some(path) = std::env::var_os("TUICANVAS_PREVIEW") else {
+            return;
+        };
+        let now = Utc::now();
+        let enter = || Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let down = || Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let mut app = App::new("https://ufl.instructure.com", None);
+        let effects = app.start();
+        let term = Some(Term {
+            name: Some("Fall 2026".into()),
+        });
+        let course = |id: &str, name: &str, code: &str, fav: bool| Course {
+            id: id.into(),
+            name: Some(name.into()),
+            course_code: Some(code.into()),
+            term: term.clone(),
+            is_favorite: Some(fav),
+            access_restricted_by_date: None,
+        };
+        deliver(
+            &mut app,
+            effects,
+            Payload::Courses(vec![
+                course("1", "GPU Computing", "EEL6763", true),
+                course("2", "Operating Systems", "COP4600", true),
+                course("3", "Compilers", "COP5621", false),
+                course("4", "Technical Writing", "ENC3246", false),
+            ]),
+        );
+        let mut page = String::from("<html><body style=\"background:#202020;padding:12px\">");
+        page += &html(&mut app, 104, 9);
+        let effects = app.update(enter());
+        let a = |id: &str, name: &str, hours: i64, sub: Option<Submission>| AssignmentSummary {
+            id: id.into(),
+            name: Some(name.into()),
+            due_at: Some(now + chrono::Duration::hours(hours)),
+            points_possible: Some(10.0),
+            submission_types: vec!["online_upload".into()],
+            submission: sub,
+            ..Default::default()
+        };
+        let graded = Submission {
+            workflow_state: Some("graded".into()),
+            submitted_at: Some(now),
+            score: Some(9.0),
+            ..Default::default()
+        };
+        let submitted = Submission {
+            submitted_at: Some(now),
+            workflow_state: Some("submitted".into()),
+            ..Default::default()
+        };
+        let missing = Submission {
+            missing: Some(true),
+            workflow_state: Some("unsubmitted".into()),
+            ..Default::default()
+        };
+        deliver(
+            &mut app,
+            effects,
+            Payload::Assignments(vec![
+                a("10", "Lab-1 Assignment", -24 * 20, Some(graded)),
+                a("11", "Lab-1 Report", -24 * 6, Some(missing)),
+                a("12", "Lab-2 Assignment", 7, Some(Submission::default())),
+                a("13", "Quiz 3", 50, Some(submitted)),
+                a(
+                    "14",
+                    "Lab-3 Assignment",
+                    24 * 12,
+                    Some(Submission::default()),
+                ),
+            ]),
+        );
+        app.update(down());
+        app.update(down());
+        page += &html(&mut app, 104, 9);
+        let effects = app.update(enter());
+        let detail = crate::model::AssignmentDetail {
+            base: a("12", "Lab-2 Assignment", 7, Some(Submission::default())),
+            description: Some("<h2>Overview</h2><p>Implement the tiled matrix multiply from lecture. The requirements are in the <a href=\"/courses/1/files/9/download\">Lab-2 slides</a>; submit a <strong>zip</strong> of your code.</p><ol><li>Implement the kernel</li><li>Report timings for three sizes</li></ol>".into()),
+            allowed_attempts: Some(2),
+            ..Default::default()
+        };
+        deliver(&mut app, effects, Payload::Detail(Box::new(detail)));
+        page += &html(&mut app, 104, 22);
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::NONE,
+        )));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        page += &html(&mut app, 104, 9);
+        page += "</body></html>";
+        std::fs::write(path, page).unwrap();
     }
 }
