@@ -4,7 +4,7 @@ Last updated: 2026-10-20. Update this file whenever a milestone moves.
 
 ## Where things stand
 
-Milestones 1 and 2 of [the build plan](build-plan.md) are done. Milestones 3–6 have not started, apart from the saved copies that came with Milestone 2.
+How the pieces fit together is described in [architecture.md](architecture.md). Milestones 1 and 2 of [the build plan](build-plan.md) are done. Milestones 3–6 have not started, apart from the saved copies that came with Milestone 2.
 
 | Milestone | State | What exists |
 | --- | --- | --- |

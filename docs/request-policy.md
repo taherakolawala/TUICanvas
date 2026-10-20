@@ -36,7 +36,7 @@ Shared rules:
 | --- | --- | --- |
 | Assignment page HTML (875 ms) | Server-rendered shell that bootstraps the JS app | Replaced by the JSON reads above |
 | ~140 scripts, 4 stylesheets, fonts, theme images | Web UI | Not needed by a terminal UI |
-| GraphQL `GetStudentAssignment` (2.2 KB, started ~3.3 s after navigation) | Assignment, rubric, submission and draft for the web submission view | Replaced by the documented REST detail read, which supplies the displayed fields without needing a submission relay id. Its rubric, drafts and media fields are deferred. A minimal GraphQL detail query was only ~10% faster (median 183 vs 213–252 ms), not enough to justify switching. |
+| GraphQL `GetStudentAssignment` (2.2 KB, started ~3.3 s after navigation) | Assignment, rubric, submission and draft for the web submission view | Replaced by the documented REST detail read, which supplies the displayed fields without needing a submission relay id. Its rubric, drafts and media fields are deferred. A minimal GraphQL detail query saved only 30–70 ms (median 183 ms vs 213–252 ms), not enough to justify leaving the documented read. |
 | GraphQL `ExternalTools` | LTI tools offered for submission | Omitted: no submission in v1 |
 | GraphQL `NextSubmission` | Submission history excluding the current attempt | Deferred: current status comes from `include[]=submission` |
 | GraphQL `GetUserGroups` | The user's groups, for group assignments | Deferred until group assignments are displayed specially |
