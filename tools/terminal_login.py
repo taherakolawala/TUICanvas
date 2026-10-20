@@ -14,11 +14,15 @@ import time
 from urllib.parse import urlsplit
 
 from tools.auth_probe import START, UF, trusted_url
-from tools.auth_ui import clean, duo_view, label, poll_key, render_view, LoginView
+from tools.auth_ui import clean, duo_view, label, poll_key, render_view, transition_view, LoginView, Status
 from tools.auth_session import (CANVAS, ORIGIN, PROFILE, NativeCanvas, SessionError,
                                load_session, profile_id, save_session)
 
 REPORT = Path(__file__).resolve().parents[1] / "benchmarks/private/auth-login-result.json"
+# Once the browser is back on Canvas, confirm sign-in with a native API read at
+# most this often, and give up on the native read after this long.
+NATIVE_CHECK_INTERVAL = 1.5
+CANVAS_SETTLE_LIMIT = 20
 
 
 def write_report(**values):
@@ -48,7 +52,8 @@ def describe_controls(page):
     controls = []
     messages = []
     for frame in page.frames:
-        if not trusted_url(frame.url):
+        # Canvas pages are never presented as sign-in prompts.
+        if not trusted_url(frame.url) or urlsplit(frame.url).hostname == CANVAS:
             continue
         try:
             messages.append(frame.locator("body").inner_text(timeout=2000)[:12000])
@@ -72,7 +77,7 @@ def describe_controls(page):
 
 def interact(page, snapshot_url, controls, choice, show_password):
     if page.url != snapshot_url:
-        print("The login screen changed; refreshing the options.")
+        # The screen changed since it was read; the caller re-reads it.
         return
     try:
         index = int(choice) - 1
@@ -83,7 +88,6 @@ def interact(page, snapshot_url, controls, choice, show_password):
         return
     handle, info, frame_url = controls[index]
     if not trusted_url(frame_url) or not handle.is_visible() or not handle.is_enabled():
-        print("That control changed; refreshing.")
         return
     # Handles never retarget an unrelated replacement element.
     if info["tag"] == "select":
@@ -112,9 +116,11 @@ def interact(page, snapshot_url, controls, choice, show_password):
         handle.click(timeout=5000)
 
 
-def browser_login(args, saved):
+def browser_login(args, saved, status=None):
     from playwright.sync_api import sync_playwright
 
+    status = status or Status()
+    status.show("Connecting to UF")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel=args.channel, headless=not args.browser)
         context = browser.new_context(storage_state=saved["browser_state"] if saved else None)
@@ -122,46 +128,67 @@ def browser_login(args, saved):
         page.goto(START, wait_until="domcontentloaded", timeout=60000)
         deadline = time.monotonic() + 600
         submitted = False
-        last_message = None
         last_view = None
         manual_prompt = False
+        canvas_since = None
+        last_native = 0.0
+        outcome = {"kind": "not_checked", "status": None}
+        url_since = (None, 0.0)
         try:
             while time.monotonic() < deadline:
-                page.wait_for_timeout(400)
-                host = urlsplit(page.url).hostname
-                if not trusted_url(page.url):
+                page.wait_for_timeout(250)
+                url = page.url
+                parsed = urlsplit(url)
+                host = parsed.hostname
+                if not trusted_url(url):
                     raise SessionError("Login reached an unexpected origin. Browser fallback may need review.")
-                if host == CANVAS and page.locator("#global_nav_profile_link").count():
-                    state = context.storage_state()
-                    ok, outcome = verify_and_save(state)
-                    if ok:
-                        write_report(stage="authenticated", native_profile=outcome, session_saved=True, mode="browser" if args.browser else "terminal")
-                        print("\nSigned in to Canvas. Your session is saved for next time.")
-                        return 0
-                    # Preserve the proven browser session so a failed native transport
+                if url != url_since[0]:
+                    url_since = (url, time.monotonic())
+                if host == CANVAS:
+                    # Back on Canvas. Never present Canvas's own page controls as a
+                    # login prompt; /login/* pages are SAML hand-off steps.
+                    if not args.browser and poll_key() == "q":
+                        return 1
+                    if parsed.path.startswith("/login"):
+                        continue
+                    status.show("Opening Canvas")
+                    # Confirm with a native API read rather than page markup,
+                    # which Canvas changes.
+                    now = time.monotonic()
+                    if canvas_since is None:
+                        canvas_since = now
+                    if now - last_native >= NATIVE_CHECK_INTERVAL:
+                        last_native = now
+                        ok, outcome = verify_and_save(context.storage_state())
+                        if ok:
+                            write_report(stage="authenticated", native_profile=outcome, session_saved=True, mode="browser" if args.browser else "terminal")
+                            status.done("Signed in. Your session is saved for next time.")
+                            return 0
+                    if now - canvas_since < CANVAS_SETTLE_LIMIT:
+                        continue
+                    # Preserve the browser session so a failed native transport
                     # experiment does not force another username/password/Duo cycle.
-                    save_session(state, None)
+                    save_session(context.storage_state(), None)
                     write_report(stage="browser_authenticated_native_pending", native_profile=outcome, session_saved=True)
-                    print("Browser login succeeded and its protected session was saved.")
-                    print("Native Canvas read did not succeed; report contains the status, not response data.")
+                    status.done("Canvas opened, but reading it directly failed. The browser session was saved.", ok=False)
                     return 2
+                canvas_since = None
                 if args.browser:
-                    if last_message != host:
-                        print("Complete the normal login in the browser. Waiting at", clean(host))
-                        last_message = host
+                    status.show("Finish signing in in the browser window")
                     continue
                 username_input = page.locator('input[name="j_username"]')
                 password_input = page.locator('input[name="j_password"]')
                 if host == UF and username_input.count() and password_input.count() and username_input.is_visible():
+                    status.clear()
                     if submitted:
-                        print("UF still shows the login form. No automatic credential retry.")
-                        if input("Enter r to retry, or q to stop: ").strip().lower() != "r":
+                        print("UF did not accept that sign-in. Nothing is retried automatically.")
+                        if input("Press r to try again, or Enter to stop: ").strip().lower() != "r":
                             return 1
-                    print("\nSign in to UF")
-                    username = input("GatorLink username: ").strip()
-                    password = input("GatorLink password (visible): ") if args.show_password else getpass.getpass("GatorLink password: ")
+                    print("Sign in with your GatorLink account")
+                    username = input("  Username: ").strip()
+                    password = input("  Password (visible): ") if args.show_password else getpass.getpass("  Password: ")
                     if not username or not password:
-                        print("Username/password required; nothing submitted.")
+                        print("Username and password are both required; nothing was sent.")
                         continue
                     if urlsplit(page.url).hostname != UF:
                         raise SessionError("Login origin changed before credential entry.")
@@ -174,42 +201,53 @@ def browser_login(args, saved):
                         raise SessionError("Login page changed before submission.")
                     page.locator('[name="_eventId_proceed"]').click()
                     submitted = True
-                    page.wait_for_timeout(1200)
+                    status.show("Checking your password")
                     continue
                 text, controls = describe_controls(page)
-                view = duo_view(text, controls)
+                if page.url != url:
+                    # The page moved on while it was being read; never describe
+                    # one page's content as another's.
+                    continue
+                on_page = time.monotonic() - url_since[1]
+                view = transition_view(host, text, controls, on_page) or duo_view(text, controls)
+                if view.kind == "waiting" and on_page < 8:
+                    # Pages without controls normally pass by on their own; show
+                    # their text only if one lingers.
+                    view = LoginView("loading", "Waiting for Duo")
                 if manual_prompt:
                     view = LoginView("manual", "Duo prompt", tuple(clean(text).splitlines()),
                                      tuple((str(n), n - 1, label(info)) for n, (_, info, _) in enumerate(controls, 1)), False)
                     manual_prompt = False
-                if view != last_view:
-                    render_view(view)
-                    last_view = view
-                snapshot_url = page.url
                 if view.automatic:
+                    status.show(view.title, status.hint(view))
+                    last_view = view
                     key = poll_key()
                     if key == "q":
                         return 1
-                    if key == "m" and view.kind in {"verified_push", "code_loading"}:
+                    if key == "m" and view.kind in {"verified_push", "code_loading", "push"}:
                         manual_prompt = True
                         continue
                     chosen = next((index for action, index, _ in view.actions if action == key), None)
-                    choice = str(chosen + 1) if chosen is not None else ""
                 else:
-                    key = input("Choose an option, Enter to check again, or q to cancel: ").strip().lower()
+                    status.clear()
+                    if view != last_view:
+                        render_view(view)
+                        last_view = view
+                    key = input("Choose an option, press Enter to check again, or q to cancel: ").strip().lower()
                     if key == "q":
                         return 1
                     chosen = next((index for action, index, _ in view.actions if action == key), None)
-                    choice = str(chosen + 1) if chosen is not None else ""
-                if choice:
+                if chosen is not None:
                     try:
-                        interact(page, snapshot_url, controls, choice, args.show_password)
+                        interact(page, url, controls, str(chosen + 1), args.show_password)
                     except Exception:
-                        print("The selected control changed or could not be used. Refreshing; no automatic retry.")
+                        status.clear()
+                        print("That option changed before it could be used; showing the current screen.")
             write_report(stage="login_timeout", session_saved=False)
-            print("Login timed out. Run again, or add --browser for the fallback.")
+            status.done("Sign-in timed out. Run again, or add --browser to sign in in a visible window.", ok=False)
             return 1
         finally:
+            status.clear()
             context.close()
             browser.close()
 
@@ -224,42 +262,48 @@ def main():
     args = parser.parse_args()
     if args.fresh and args.check:
         parser.error("--fresh and --check cannot be combined")
+    status = Status()
     try:
         saved = None if args.fresh else load_session()
         if saved:
+            status.show("Checking your saved session")
             ok, outcome = verify_and_save(saved["browser_state"], saved.get("user_id"))
             if ok:
-                print("Signed in to Canvas using your saved session.")
+                status.done("Signed in with your saved session.")
                 write_report(stage="session_reused", native_profile=outcome, session_saved=True)
                 return 0
-            print("Saved session native check:", outcome["kind"], outcome["status"])
             if outcome["kind"] == "network_error":
                 write_report(stage="network_error", native_profile=outcome, session_saved=True)
-                print("Session retained. Retry when the connection is available.")
+                status.done("Could not reach Canvas. Your session was kept; try again when you are online.", ok=False)
                 return 1
+            status.done("Your Canvas session has expired. Sign in to continue.", ok=False)
         if args.check:
-            print("No usable native session yet. Run without --check to sign in.")
+            status.done("No usable saved session. Run without --check to sign in.", ok=False)
             return 1
         if not sys.stdin.isatty():
             parser.exit(2, "Run this command in your own interactive terminal.\n")
-        print("Connecting to UF...")
-        return browser_login(args, saved)
+        return browser_login(args, saved, status)
     except SessionError as exc:
+        status.clear()
         print(str(exc), file=sys.stderr)
         write_report(stage="session_error", session_saved=False)
         return 1
     except ImportError:
+        status.clear()
         print("Run using .venv\\Scripts\\python.exe; Playwright is required for login.", file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
+        status.clear()
         print("\nCancelled.")
         return 1
     except Exception as exc:
+        status.clear()
         # Browser exceptions may contain credential-bearing URLs. Never print them.
-        print("Login stopped (" + type(exc).__name__ + "). Try --browser if this challenge needs a visible browser.", file=sys.stderr)
+        print("Sign-in stopped (" + type(exc).__name__ + "). Try --browser if this challenge needs a visible browser.", file=sys.stderr)
         write_report(stage="login_error", error_type=type(exc).__name__)
         return 1
-
+    finally:
+        status.close()
 
 if __name__ == "__main__":
     raise SystemExit(main())
