@@ -4,13 +4,13 @@ Last updated: 2026-10-20. Update this file whenever a milestone moves.
 
 ## Where things stand
 
-How the pieces fit together is described in [architecture.md](architecture.md). Milestones 1 and 2 of [the build plan](build-plan.md) are done. Milestones 3–6 have not started, apart from the saved copies that came with Milestone 2.
+How the pieces fit together is described in [architecture.md](architecture.md). Milestones 1–3 of [the build plan](build-plan.md) are done. Milestone 4 is partly done through the saved copies that came with Milestone 2; Milestones 5 and 6 have not started.
 
 | Milestone | State | What exists |
 | --- | --- | --- |
 | 1. Sign-in and request experiment | **Done** | Terminal sign-in (GatorLink + Duo); live-verified native REST and GraphQL reads; failure classification; [request policy](request-policy.md) |
 | 2. Reader vertical slice | **Done** | Courses → assignments → assignment detail, with saved copy + Syncing, refresh, back, filter, open in browser |
-| 3. Rendering and network baseline | Not started | `--dump` and `--diag` record render and request timings; no browser comparison yet |
+| 3. Rendering and network baseline | **Done** | Network, parse and draw timed separately (`--diag`, `--bench`); automated website baseline; the reader shows fresh data 6–10× sooner than the website ([baseline](../benchmarks/baseline-2026-10-20.md)) |
 | 4. Selective resource reuse | Partly | Saved copies for courses, assignment lists and details only (always re-read on entry) |
 | 5. Prediction experiment | Not started | |
 | 6. Hardening and delivery | Not started | |
@@ -29,7 +29,13 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - Course list: REST, about 300 ms and 22 KB.
   - Assignment list: GraphQL, median about 300 ms per course. The REST equivalent is about 600 ms with a 9.6 s worst case, and its 944 KB total drops to 64–75 KB. The data matched REST on every assignment.
   - Assignment detail: REST, about 210–250 ms and 4 KB.
-- **Checks.** 42 Rust tests (Windows) and 29 Python tests pass. `tuicanvas --smoke` re-verifies live reads; `tuicanvas --dump DIR` renders each screen headlessly.
+- **Measured against the website** ([baseline](../benchmarks/baseline-2026-10-20.md)), same machine and session, median of 10 runs:
+  - Fresh content: 0.27–0.33 s per step in the reader vs 2.1–2.7 s on the website.
+  - Requests: 1 per screen vs 130–190.
+  - Saved copies appear in about 1 ms.
+  - The reader's own work (parse, update, draw) takes 1–3 ms; the rest is Canvas's response time.
+  - All three build-plan performance goals are met.
+- **Checks.** 44 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads; `tuicanvas --dump DIR` renders each screen headlessly.
 
 ## Known issues and limits
 
@@ -39,19 +45,17 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 - **Order of undated assignments** differs from Canvas in 1 of 17 courses (cosmetic).
 - **Back re-reads the list.** Returning to a list from a detail re-reads it, per the approved "fresh on every entry" rule. This costs one request per Back.
 - **Git Bash** may print sign-in progress as separate lines instead of one updating line. PowerShell and Windows Terminal show the spinner properly.
-- **No performance comparison against the Canvas website yet.** The only browser capture is one assignment page (`benchmarks/initial-findings.md`).
+- **The baseline is narrow:** one machine, one evening, 10 runs, with the browser headless. Good for medians, not for tail latency.
 - **Out of scope for v1:** files and attachments (links are shown, not opened), modules, discussions, inbox, calendar, submitting.
 
 ## What's next
 
-1. **Milestone 3, baseline comparison.**
-   - Record the browser workflow (dashboard → GPU Computing → Lab-2) 5–10 times with DevTools Performance and an exported HAR, following `benchmarks/README.md`. *Needs you: browser captures.*
-   - Time the same workflow in the reader with `--diag` and `--dump`.
-   - Report medians and ranges for time to usable content, request counts and bytes.
-2. **Session lifetime.** Run with `--diag` over several days to learn how long sessions last, and whether choosing "remember this device" in Duo skips the push.
-3. **Milestone 4.** Decide per resource whether anything beyond the three saved copies is worth reusing (for example, the course list, which rarely changes).
-4. **Milestone 5.** Prefetch an assignment's detail after its row stays selected for about 150 ms, under the approved 2-second freshness rule. Measure hits and wasted requests with prediction on and off.
-5. **Milestone 6.**
+The baseline shows that almost all remaining time is Canvas's network response (≈260–410 ms per read), so the next wins come from overlapping or avoiding reads rather than from faster local code.
+
+1. **Milestone 4.** Decide per resource whether anything beyond the three saved copies is worth reusing. For example, the course list (21 KB, rarely changes) could be shown from its saved copy and refreshed less often. Each change needs your approval under the freshness rules.
+2. **Milestone 5.** Prefetch an assignment's detail after its row stays selected for about 150 ms, under the approved 2-second freshness rule. That could hide most of the ≈270 ms detail read. Measure hits and wasted requests with prediction on and off, using `--bench` and `--diag`.
+3. **Session lifetime.** Run with `--diag` over several days to learn how long sessions last, and whether choosing "remember this device" in Duo skips the push.
+4. **Milestone 6.**
    - Hardening: throttling, resizing, terminal restore on errors, install instructions.
    - Possibly a Rust-native sign-in to remove the Python dependency (a decision for later).
 
@@ -60,6 +64,8 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\check.ps1 -Tasks "pytest build test smoke"
 target\release\tuicanvas.exe --dump .tools\dev
+target\release\tuicanvas.exe --bench 10
+.venv\Scripts\python.exe -m tools.browser_bench --runs 10
 ```
 
-`--smoke` writes `benchmarks/private/smoke.json` (metadata only); `--dump` writes the rendered screens as text.
+`--smoke` writes `benchmarks/private/smoke.json` (metadata only). `--dump` writes the rendered screens as text. The two benchmarks write `benchmarks/private/tui-bench.json` and `browser-bench.json`.

@@ -1,6 +1,6 @@
 # Canvas baseline capture
 
-Status: workflow inspected and one assignment-detail HAR analyzed (see initial-findings.md). Repeated end-to-end baseline and usable-content timings remain pending.
+Status: the end-to-end baseline is recorded in [baseline-2026-10-20.md](baseline-2026-10-20.md), produced by `tools/browser_bench.py` and `tuicanvas --bench`. The manual DevTools capture method below is still useful when a full performance trace is wanted.
 
 ## Selected workflow
 

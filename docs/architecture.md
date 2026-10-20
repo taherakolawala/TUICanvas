@@ -212,7 +212,7 @@ Details that matter:
 
 | Optimization | Where | Effect (measured where noted) |
 | --- | --- | --- |
-| Skip the web app entirely | whole design | The Canvas assignment page made 183 requests (1.4 MB) and fetched its data ~3.3 s after navigation began. The reader makes one read per screen: courses ≈22 KB, assignment detail ≈4 KB. |
+| Skip the web app entirely | whole design | Measured ([baseline](../benchmarks/baseline-2026-10-20.md)): fresh content in 0.27–0.33 s per step vs 2.1–2.7 s on the website, with 1 request (2–21 KB) per screen instead of 130–190 requests |
 | Field-selected GraphQL for assignment lists | `api.rs` | Across 17 courses: 64–75 KB instead of 944 KB, median ≈300 ms instead of ≈600 ms per course, worst case 1.9 s instead of 9.6 s. Verified identical data on all 157 assignments. |
 | REST kept where GraphQL gains little | `api.rs` | A minimal GraphQL detail query saved 30–70 ms (median 183 ms vs 213–252 ms on a 4 KB response), so the documented REST read stays |
 | Saved copy shown instantly, then refreshed | `app.rs`, `cache.rs` | Revisited screens appear with no network wait; freshness still guaranteed by the re-read |
@@ -238,7 +238,6 @@ Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke`
 - **Prediction / prefetch** (Milestone 5): fetching an assignment's detail after its row stays selected for about 150 ms. The approved 2-second freshness rule is already in place for it to use.
 - **Conditional requests** (`If-None-Match`): Canvas sends validators, but whether it honours them for these reads, and saves anything, is unmeasured.
 - **Longer-lived caching** of resources that rarely change (for example, the course list) without re-reading on entry. This needs a per-resource decision (Milestone 4).
-- **A measured comparison with the Canvas website** for the whole workflow (Milestone 3).
 - **Rust-native sign-in,** which would remove the Python, Playwright and Edge dependency.
 
 ## Safety properties
@@ -257,5 +256,7 @@ Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke`
 | `cargo test`, `python -m unittest tools.test_*` | Unit tests with a scripted transport, synthetic sessions and replayed Duo screens; no network, credentials or MFA |
 | `tuicanvas --smoke` | Live read-only verification and measurement → `benchmarks/private/smoke.json` |
 | `tuicanvas --dump DIR` | Walks courses → course → assignment headlessly and writes each rendered screen as text, with render and sync timings |
-| `tuicanvas --diag` | Logs every request's template, status, size and timing to `%LOCALAPPDATA%\TUICanvas\diagnostics.jsonl` |
+| `tuicanvas --diag` | Logs every request (template, status, size, timing) and every frame to `%LOCALAPPDATA%\TUICanvas\diagnostics.jsonl`. Frames: startup to first frame, each key to its frame, and each read from the action that caused it to the frame showing its data, split into network, parse and response-to-frame. Also logs CPU and peak memory at exit. |
+| `tuicanvas --bench N` | Runs start → course list → course → assignment → back N times, cold and warm, on an in-memory screen (or `--terminal` for a real console). Uses a private snapshot folder. Writes `benchmarks/private/tui-bench*.json`. |
+| `tools/browser_bench.py` | The same workflow on the Canvas website in headless Edge with the saved session. Content-visible time is taken from the page's own clock; requests and transferred bytes are counted with DevTools Protocol events. Writes `benchmarks/private/browser-bench.json`. |
 | `scripts/check.ps1`, `scripts/watch.ps1` | Build, test, live checks and git tasks on Windows, on request |

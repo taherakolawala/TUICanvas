@@ -13,7 +13,7 @@ Mon Oct 5 11:59 PM   Lab-1 Assignment                 Graded 9/10        10 pts
 
 ## Status
 
-Current progress, known issues and next steps: [docs/status.md](docs/status.md). How it works and which optimizations are in place: [docs/architecture.md](docs/architecture.md).
+Current progress, known issues and next steps: [docs/status.md](docs/status.md). How it works and which optimizations are in place: [docs/architecture.md](docs/architecture.md). Measured against the Canvas website: [benchmarks/baseline-2026-10-20.md](benchmarks/baseline-2026-10-20.md).
 
 Version 1 is in progress. It covers sign in (GatorLink + Duo) → course list → assignment list → assignment details (deadline, submission status, description).
 
@@ -55,6 +55,7 @@ tuicanvas --login         Sign in again
 tuicanvas --logout        Delete the saved session and this account's saved copies
 tuicanvas --diag          Log request timings (no content) to the data folder
 tuicanvas --smoke         Read-only live check -> benchmarks/private/smoke.json
+tuicanvas --bench [N]     Time the workflow N times -> benchmarks/private/tui-bench.json
 ```
 
 | Key | Action |

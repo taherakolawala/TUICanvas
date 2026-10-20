@@ -1,6 +1,6 @@
 # TUICanvas build plan
 
-Status: approved by the user on 2026-10-15 with the amendments incorporated below. Milestones 1 and 2 are complete; see [status.md](status.md) for current progress and next steps.
+Status: approved by the user on 2026-10-15 with the amendments incorporated below. Milestones 1–3 are complete; see [status.md](status.md) for current progress and next steps.
 
 ## Objective and boundaries
 
