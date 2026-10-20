@@ -194,12 +194,18 @@ impl CanvasClient {
                         rate_limit_remaining: None,
                         request_cost: None,
                         outcome: "network_error",
+                        error_hint: None,
                     });
                     return Err(CanvasError::Network(e));
                 }
             };
             self.absorb_cookies(path, &response);
-            let verdict = classify(&response);
+            let verdict = match classify(&response) {
+                // Canvas answers a missing/invalid CSRF token on a POST with a bare
+                // 422 "An error occurred."; our only POSTs are read-only GraphQL.
+                Err(CanvasError::Http(422)) if method == Method::Post => Err(CanvasError::Csrf),
+                other => other,
+            };
             self.diag.record(Exchange {
                 started_ms,
                 method: method_name,
@@ -218,6 +224,7 @@ impl CanvasClient {
                     .err()
                     .map(CanvasError::kind)
                     .unwrap_or("ok"),
+                error_hint: verdict.as_ref().err().and_then(|_| error_hint(&response)),
             });
             match verdict {
                 Err(CanvasError::Throttled) if attempt < MAX_THROTTLE_RETRIES => {
@@ -361,6 +368,21 @@ pub fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, CanvasError> {
 
 /// Map an HTTP response to success or a failure class without reading
 /// anything but status, a few headers, and Canvas's JSON error envelope.
+/// Canvas's error message from a JSON error envelope, safe to log: control
+/// characters removed, URLs cut, at most 120 characters.
+pub fn error_hint(response: &HttpResponse) -> Option<String> {
+    let envelope: Value = parse_json(&response.body).ok()?;
+    let message = envelope
+        .get("errors")
+        .and_then(|e| e.get(0).or(Some(e)))
+        .and_then(|e| e.get("message").or(Some(e)))
+        .and_then(Value::as_str)
+        .or_else(|| envelope.get("message").and_then(Value::as_str))
+        .or_else(|| envelope.get("status").and_then(Value::as_str))?;
+    let cut = message.split("http").next().unwrap_or("");
+    Some(clip(cut.trim(), 120))
+}
+
 pub fn classify(response: &HttpResponse) -> Result<(), CanvasError> {
     let status = response.status;
     if (200..300).contains(&status) {
@@ -414,7 +436,10 @@ pub fn classify(response: &HttpResponse) -> Result<(), CanvasError> {
         403 if body_text.contains("rate limit") => Err(CanvasError::Throttled),
         403 => Err(CanvasError::NoAccess(403)),
         404 => Err(CanvasError::NotFound),
-        422 if body_text.contains("authenticity") || body_text.contains("csrf") => {
+        422 if body_text.contains("authenticity")
+            || body_text.contains("csrf")
+            || first_message.contains("token") =>
+        {
             Err(CanvasError::Csrf)
         }
         429 => Err(CanvasError::Throttled),
@@ -656,6 +681,21 @@ pub mod tests {
             classify(&resp(200, "<html>")),
             Err(CanvasError::Invalid("non-JSON response"))
         );
+    }
+
+    #[tokio::test]
+    async fn graphql_422_is_a_csrf_rejection() {
+        let t = FakeTransport::new(vec![json(
+            422,
+            r#"{"errors":[{"message":"An error occurred."}]}"#,
+        )]);
+        let c = client(t);
+        let err = c
+            .graphql_with("query { a }", serde_json::json!({}), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CanvasError::Csrf);
+        assert!(err.needs_login());
     }
 
     #[tokio::test]

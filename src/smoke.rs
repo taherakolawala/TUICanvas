@@ -21,19 +21,6 @@ pub const DETAIL_GQL: &str = "query TuiAssignment($id: ID!) {
   }
 }";
 
-pub const LIST_GQL: &str = "query TuiAssignments($courseId: ID!) {
-  course(id: $courseId) {
-    assignmentsConnection(first: 100) {
-      nodes {
-        _id name dueAt pointsPossible submissionTypes
-        lockInfo { isLocked }
-        submissionsConnection(first: 1) { nodes { state submittedAt late missing score grade } }
-      }
-      pageInfo { hasNextPage }
-    }
-  }
-}";
-
 pub struct SmokeOptions {
     pub course: String,
     pub assignment: String,
@@ -159,14 +146,6 @@ pub fn run(config: &Config, opts: SmokeOptions) -> Result<i32, String> {
             steps.push(json!({"name": "assignments_rest", "outcome": outcome(&list), "error": err_detail(&list)}));
         }
 
-        // 4. GraphQL list variant: is a field-selected list smaller/faster?
-        let gql_list = client.graphql(LIST_GQL, json!({"courseId": course.id})).await;
-        steps.push(json!({"name": "assignments_graphql", "outcome": outcome(&gql_list),
-            "stats": gql_list.as_ref().ok().map(|(_, s)| stats_json(s)),
-            "count": gql_list.as_ref().ok().and_then(|(d, _)| d.pointer("/course/assignmentsConnection/nodes")).and_then(Value::as_array).map(Vec::len),
-            "has_next_page": gql_list.as_ref().ok().and_then(|(d, _)| d.pointer("/course/assignmentsConnection/pageInfo/hasNextPage")).cloned(),
-            "error": err_detail(&gql_list)}));
-
         // 5. Assignment detail: REST vs GraphQL, alternated, three runs each.
         let Some(assignment) = assignment else {
             println!("assignments: none available");
@@ -217,6 +196,168 @@ pub fn run(config: &Config, opts: SmokeOptions) -> Result<i32, String> {
         steps.push(json!({"name": "profile_without_session", "outcome": outcome(&anon), "expected": "unauthenticated"}));
         let foreign: Result<(Value, FetchStats), CanvasError> = client.get_json("/api/v1/courses/1").await;
         steps.push(json!({"name": "course_not_enrolled", "outcome": outcome(&foreign), "expected": "no_access or not_found"}));
+
+        // 7. Schema check for the fields the GraphQL list relies on.
+        let wanted_assignment = ["_id", "name", "dueAt", "unlockAt", "lockAt", "pointsPossible", "submissionTypes", "htmlUrl", "position", "lockInfo", "submissionsConnection"];
+        let wanted_submission = ["state", "submittedAt", "late", "missing", "excused", "score", "grade", "attempt"];
+        let intro = client
+            .graphql("query { a: __type(name: \"Assignment\") { fields { name } } s: __type(name: \"Submission\") { fields { name } } }", json!({}))
+            .await;
+        let names = |data: &Value, alias: &str| -> Vec<String> {
+            data.pointer(&format!("/{alias}/fields")).and_then(Value::as_array).map(|f| {
+                f.iter().filter_map(|x| x.get("name").and_then(Value::as_str).map(str::to_string)).collect()
+            }).unwrap_or_default()
+        };
+        let missing = intro.as_ref().ok().map(|(d, _)| {
+            let a = names(d, "a");
+            let s = names(d, "s");
+            json!({
+                "assignment": wanted_assignment.iter().filter(|w| !a.iter().any(|n| n == *w)).collect::<Vec<_>>(),
+                "submission": wanted_submission.iter().filter(|w| !s.iter().any(|n| n == *w)).collect::<Vec<_>>(),
+            })
+        });
+        steps.push(json!({"name": "graphql_schema_fields", "outcome": outcome(&intro), "missing": missing, "error": err_detail(&intro)}));
+        // Schema details for choosing the submission filter (type names only).
+        let schema = client
+            .graphql(
+                "query {
+                  a: __type(name: \"Assignment\") { fields { name args { name defaultValue type { name kind ofType { name } } } } }
+                  st: __type(name: \"SubmissionState\") { enumValues { name } }
+                  f: __type(name: \"SubmissionSearchFilterInput\") { inputFields { name defaultValue type { name kind ofType { name kind ofType { name } } } } }
+                }",
+                json!({}),
+            )
+            .await;
+        let schema_summary = schema.as_ref().ok().map(|(d, _)| {
+            let fields = d.pointer("/a/fields").and_then(Value::as_array).cloned().unwrap_or_default();
+            let submission_fields: Vec<Value> = fields
+                .iter()
+                .filter(|f| f.get("name").and_then(Value::as_str).is_some_and(|n| n.to_lowercase().contains("submission")))
+                .cloned()
+                .collect();
+            json!({"assignment_submission_fields": submission_fields, "submission_states": d.pointer("/st/enumValues"), "filter_input": d.pointer("/f/inputFields")})
+        });
+        steps.push(json!({"name": "graphql_schema_submissions", "outcome": outcome(&schema), "schema": schema_summary, "error": err_detail(&schema)}));
+
+        // 8. REST vs GraphQL assignment lists on every active course: same
+        //    assignments, due dates, status and order? Sizes and timings.
+        let mut per_course = Vec::new();
+        let (mut rest_ms, mut gql_ms) = (Vec::new(), Vec::new());
+        let (mut rest_bytes, mut gql_bytes) = (0usize, 0usize);
+        let mut totals = serde_json::Map::new();
+        let mut tie_totals: std::collections::BTreeMap<&str, u32> = Default::default();
+        let now = chrono::Utc::now();
+        let all_courses = courses.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+        for (index, c) in all_courses.iter().enumerate() {
+            let (rest, gql) = if index % 2 == 0 {
+                let r = api::assignments(&client, &c.id).await;
+                (r, api::assignments_graphql(&client, &c.id).await)
+            } else {
+                let g = api::assignments_graphql(&client, &c.id).await;
+                (api::assignments(&client, &c.id).await, g)
+            };
+            let mut entry = serde_json::Map::new();
+            entry.insert("rest".into(), outcome(&rest));
+            entry.insert("graphql".into(), outcome(&gql));
+            if gql.is_err() {
+                entry.insert("graphql_error".into(), err_detail(&gql));
+            }
+            if let (Ok((r, rs)), Ok((g, gs))) = (&rest, &gql) {
+                rest_ms.push(rs.ms);
+                gql_ms.push(gs.ms);
+                rest_bytes += rs.bytes;
+                gql_bytes += gs.bytes;
+                let mut diffs: Vec<Value> = Vec::new();
+                let mut bump = |field: &str, detail: Value| {
+                    let n = totals.entry(field.to_string()).or_insert(json!(0));
+                    *n = json!(n.as_u64().unwrap_or(0) + 1);
+                    if diffs.len() < 8 {
+                        diffs.push(json!({"field": field, "detail": detail}));
+                    }
+                };
+                for a in r {
+                    let Some(b) = g.iter().find(|b| b.id == a.id) else { bump("only_in_rest", Value::Null); continue };
+                    if a.due_at != b.due_at {
+                        let secs = match (a.due_at, b.due_at) { (Some(x), Some(y)) => json!((x - y).num_seconds()), _ => json!("one side missing") };
+                        bump("due_at", secs);
+                    }
+                    if a.points_possible.map(|p| (p * 100.0).round()) != b.points_possible.map(|p| (p * 100.0).round()) {
+                        bump("points", Value::Null);
+                    }
+                    let (sa, sb) = (a.status(now).0, b.status(now).0);
+                    if sa != sb {
+                        bump("status", json!({"rest": sa, "graphql": sb}));
+                    }
+                    if a.locked_for_user.unwrap_or(false) != b.locked_for_user.unwrap_or(false) {
+                        bump("locked", json!({"rest": a.locked_for_user, "graphql": b.locked_for_user}));
+                    }
+                    let (mut ta, mut tb) = (a.submission_types.clone(), b.submission_types.clone());
+                    ta.sort();
+                    tb.sort();
+                    if ta != tb {
+                        bump("submission_types", json!({"rest": ta, "graphql": tb}));
+                    }
+                    if a.html_url != b.html_url {
+                        bump("html_url", json!({"graphql_present": b.html_url.is_some()}));
+                    }
+                }
+                for b in g {
+                    if !r.iter().any(|a| a.id == b.id) {
+                        bump("only_in_graphql", Value::Null);
+                    }
+                }
+                let order_r: Vec<&str> = r.iter().map(|a| a.id.as_str()).collect();
+                let order_g: Vec<&str> = g.iter().map(|a| a.id.as_str()).collect();
+                if order_r != order_g {
+                    // Classify each out-of-place pair: tie on due date, or both undated?
+                    let due_of = |id: &str| r.iter().find(|a| a.id == id).and_then(|a| a.due_at);
+                    let mut kinds = serde_json::Map::new();
+                    for (x, y) in order_r.iter().zip(order_g.iter()) {
+                        if x != y {
+                            let kind = match (due_of(x), due_of(y)) {
+                                (Some(p), Some(q)) if p == q => "same_due",
+                                (None, None) => "both_undated",
+                                (Some(_), None) | (None, Some(_)) => "dated_vs_undated",
+                                _ => "different_due",
+                            };
+                            let n = kinds.entry(kind).or_insert(json!(0));
+                            *n = json!(n.as_u64().unwrap_or(0) + 1);
+                        }
+                    }
+                    bump("order", Value::Object(kinds));
+                }
+                // Which tie-break reproduces Canvas's own REST order?
+                let mut resorted = r.clone();
+                api::sort_by_due(&mut resorted);
+                entry.insert("rest_order_reproduced".into(), json!(resorted.iter().map(|a| &a.id).eq(r.iter().map(|a| &a.id))));
+                let mut reproduced = Vec::new();
+                for (name, cmp) in tie_breaks() {
+                    let mut trial = r.clone();
+                    trial.sort_by(|a, b| due_cmp(a, b).then_with(|| cmp(a, b)));
+                    if trial.iter().map(|a| &a.id).eq(r.iter().map(|a| &a.id)) {
+                        reproduced.push(name);
+                        *tie_totals.entry(name).or_insert(0) += 1;
+                    }
+                }
+                entry.insert("tie_breaks_reproducing_rest".into(), json!(reproduced));
+                entry.insert("assignments".into(), json!(r.len()));
+                entry.insert("rest".into(), stats_json(rs));
+                entry.insert("graphql".into(), stats_json(gs));
+                entry.insert("differences".into(), Value::Array(diffs));
+            }
+            per_course.push(Value::Object(entry));
+        }
+        steps.push(json!({
+            "name": "list_equivalence_all_courses",
+            "courses": per_course.len(),
+            "difference_totals": totals,
+            "rest_total_bytes": rest_bytes,
+            "graphql_total_bytes": gql_bytes,
+            "courses_reproduced_by_tie_break": tie_totals,
+            "rest_median_ms": (median(&mut rest_ms.clone()) * 10.0).round() / 10.0,
+            "graphql_median_ms": (median(&mut gql_ms.clone()) * 10.0).round() / 10.0,
+            "per_course": per_course,
+        }));
     });
 
     let exchanges = diag.recent();
@@ -226,7 +367,7 @@ pub fn run(config: &Config, opts: SmokeOptions) -> Result<i32, String> {
         json!(exchanges.iter().map(|e| json!({
         "method": e.method, "template": e.template, "status": e.status, "bytes": e.bytes,
         "ms": (e.ms * 10.0).round() / 10.0, "outcome": e.outcome,
-        "rate_limit_remaining": e.rate_limit_remaining, "request_cost": e.request_cost,
+        "rate_limit_remaining": e.rate_limit_remaining, "request_cost": e.request_cost, "error_hint": e.error_hint,
     })).collect::<Vec<_>>()),
     );
 
@@ -249,4 +390,115 @@ pub fn run(config: &Config, opts: SmokeOptions) -> Result<i32, String> {
     println!("{text}");
     println!("Report written to benchmarks/private/smoke.json");
     Ok(exit)
+}
+
+type Cmp = fn(&AssignmentSummary, &AssignmentSummary) -> std::cmp::Ordering;
+
+fn due_cmp(a: &AssignmentSummary, b: &AssignmentSummary) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.due_at, b.due_at) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn numeric_id(a: &AssignmentSummary) -> u128 {
+    a.id.replace('~', "").parse().unwrap_or(u128::MAX)
+}
+
+/// Case-insensitive comparison treating digit runs as numbers ("Lab 2" < "Lab 10").
+fn natural(a: &str, b: &str) -> std::cmp::Ordering {
+    let key = |s: &str| {
+        let mut parts: Vec<(u8, String, u128)> = Vec::new();
+        let mut chars = s.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                let mut n = String::new();
+                while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                    n.push(d);
+                    chars.next();
+                }
+                parts.push((0, String::new(), n.parse().unwrap_or(u128::MAX)));
+            } else {
+                let mut t = String::new();
+                while let Some(&d) = chars.peek().filter(|d| !d.is_ascii_digit()) {
+                    t.extend(d.to_lowercase());
+                    chars.next();
+                }
+                parts.push((1, t, 0));
+            }
+        }
+        parts
+    };
+    key(a).cmp(&key(b))
+}
+
+fn tie_breaks() -> Vec<(&'static str, Cmp)> {
+    vec![
+        ("name_bytes", |a, b| a.title().cmp(b.title())),
+        ("name_ci", |a, b| {
+            a.title().to_lowercase().cmp(&b.title().to_lowercase())
+        }),
+        ("name_natural_ci", |a, b| natural(a.title(), b.title())),
+        ("name_ci_then_id", |a, b| {
+            a.title()
+                .to_lowercase()
+                .cmp(&b.title().to_lowercase())
+                .then_with(|| numeric_id(a).cmp(&numeric_id(b)))
+        }),
+        ("icu_like", |a, b| {
+            icu_key(a.title(), false).cmp(&icu_key(b.title(), false))
+        }),
+        ("icu_like_numeric", |a, b| {
+            icu_key(a.title(), true).cmp(&icu_key(b.title(), true))
+        }),
+        ("alnum_ci", |a, b| alnum(a.title()).cmp(&alnum(b.title()))),
+        ("id", |a, b| numeric_id(a).cmp(&numeric_id(b))),
+        ("position_then_id", |a, b| {
+            a.position
+                .cmp(&b.position)
+                .then_with(|| numeric_id(a).cmp(&numeric_id(b)))
+        }),
+        ("position_then_name_ci", |a, b| {
+            a.position
+                .cmp(&b.position)
+                .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
+        }),
+    ]
+}
+
+/// Approximates ICU root collation at primary strength: whitespace < punctuation
+/// < digits < letters, case-insensitive; optionally digit runs as numbers.
+fn icu_key(s: &str, numeric: bool) -> Vec<(u8, u128, char)> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if numeric && c.is_ascii_digit() {
+            let mut n = c.to_digit(10).unwrap_or(0) as u128;
+            while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
+                n = n.saturating_mul(10).saturating_add(d as u128);
+                chars.next();
+            }
+            out.push((2, n, '0'));
+            continue;
+        }
+        let class = if c.is_whitespace() {
+            0
+        } else if c.is_alphanumeric() {
+            if c.is_numeric() { 2 } else { 3 }
+        } else {
+            1
+        };
+        out.push((class, 0, c.to_lowercase().next().unwrap_or(c)));
+    }
+    out
+}
+
+fn alnum(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }

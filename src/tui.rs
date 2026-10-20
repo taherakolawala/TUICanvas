@@ -53,7 +53,7 @@ impl Executor {
                 ResourceKey::Courses => api::courses(&client)
                     .await
                     .map(|(v, s)| (Payload::Courses(v), s)),
-                ResourceKey::Assignments(c) => api::assignments(&client, c)
+                ResourceKey::Assignments(c) => api::assignment_list(&client, c)
                     .await
                     .map(|(v, s)| (Payload::Assignments(v), s)),
                 ResourceKey::Detail(c, a) => api::assignment(&client, c, a)
@@ -150,7 +150,6 @@ pub fn run_login_helper(config: &Config) -> Result<(), String> {
             config.project_dir.display()
         )
     })?;
-    println!("Starting sign-in…");
     let status = std::process::Command::new(python)
         .args(["-m", "tools.terminal_login"])
         .current_dir(dir)

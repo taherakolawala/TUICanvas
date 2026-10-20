@@ -19,6 +19,9 @@ pub struct Exchange {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_cost: Option<f64>,
     pub outcome: &'static str,
+    /// Canvas's generic error message for failed requests (sanitized, clipped, no URLs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_hint: Option<String>,
 }
 
 /// Bounded in-memory log, optionally mirrored to a JSONL file.
