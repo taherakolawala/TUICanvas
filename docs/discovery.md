@@ -50,7 +50,7 @@ Use a browser performance trace alongside the network waterfall to distinguish s
 
 The installation is https://ufl.instructure.com/. Opening it in the connected browser redirected to https://elearning.ufl.edu/. The GatorLink link points to `/login/saml/355` on the Canvas installation and redirects to UF's SAML login at login.ufl.edu. The user completed sign-in. An initial user-provided HAR has been analyzed; it captures one assignment-detail navigation rather than the full selected workflow. See benchmarks/initial-findings.md. Repeated baseline and usable-content measurements are still pending.
 
-This establishes the interactive login entry point, but does not yet establish session lifetime, cookie behavior, API access through the session, or whether requests can be made outside the browser.
+This established the interactive login entry point. Later work established native API access through the saved session, CSRF behaviour and failure classes (see [request-policy.md](request-policy.md)); session lifetime is still being measured (see [status.md](status.md)).
 
 The terminal-driven browser-engine helper completed a live Duo Verified Push login with user input. DPAPI-protected session storage and a native Canvas profile read succeeded. A later native check reused the session without launching a browser. The terminal UX now automatically advances known loading/approval/success stages and presents a clear code and y/n remembered-device choice. See docs/authentication.md for commands and remaining limits.
 

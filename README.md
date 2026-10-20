@@ -13,6 +13,8 @@ Mon Oct 5 11:59 PM   Lab-1 Assignment                 Graded 9/10        10 pts
 
 ## Status
 
+Current progress, known issues and next steps: [docs/status.md](docs/status.md).
+
 Version 1 is in progress. It covers sign in (GatorLink + Duo) → course list → assignment list → assignment details (deadline, submission status, description).
 
 - Every screen shows a saved copy right away, with **Syncing…** at the top while it fetches fresh data. If the fetch fails, the screen says **Outdated** instead of pretending the old copy is current.

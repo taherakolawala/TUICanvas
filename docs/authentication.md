@@ -62,6 +62,6 @@ Check session reuse without launching a browser:
 
 The helper uses stored sessions first on normal runs as well. `--fresh` ignores saved state for a new login. Reuse still depends on UF/Canvas expiry and MFA policy; exported cookie/localStorage state does not promise preservation of every browser remembered-device signal.
 
-The new diagnostic report is `benchmarks/private/auth-login-result.json`; it contains stage/status metadata only. The old probe remains useful for isolated form inspection. The helper is an authentication experiment; the Rust TUI has not been implemented yet.
+The new diagnostic report is `benchmarks/private/auth-login-result.json`; it contains stage/status metadata only. The old probe remains useful for isolated form inspection. The Rust reader reads this same protected session and runs the helper whenever sign-in is needed (see [status.md](status.md)).
 
 Automated checks cover cookie scope, expiration/path matching, rotated/deleted cookie handling, native origin restrictions, CSRF scope, terminal-control filtering, response redaction, Windows encryption round trips, and replay of the observed Duo screen sequence. The streamlined presentation has been tested against synthetic versions of the observed screens; a new cold login has not been triggered solely to retest its appearance. The original helper's terminal Duo completion and native reads were live-verified by the user's run, followed by our successful native saved-session check.
