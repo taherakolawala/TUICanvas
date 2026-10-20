@@ -11,7 +11,6 @@ $log = Join-Path $dev "result-$Id.log"
 $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
 if (($env:Path -split ';') -notcontains $cargoBin) { $env:Path = "$cargoBin;$env:Path" }
 $env:CARGO_TERM_COLOR = 'never'
-$env:NO_COLOR = '1'
 "TUICanvas check #$Id  tasks: $Tasks  started $(Get-Date -Format o)" | Set-Content $log -Encoding utf8
 
 function Step([string]$label, [scriptblock]$command) {
