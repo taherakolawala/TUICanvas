@@ -158,6 +158,8 @@ pub struct App {
     pub dirty: bool,
     pub spinner: usize,
     pub detail_render: Option<DetailRender>,
+    /// Request ids whose responses were applied since the runtime last drained this (for timing).
+    pub applied: Vec<u64>,
     /// Start sign-in automatically if the first read at startup finds the session expired.
     auto_login: bool,
 }
@@ -184,6 +186,7 @@ impl App {
             dirty: true,
             spinner: 0,
             detail_render: None,
+            applied: Vec::new(),
             auto_login: false,
         }
     }
@@ -352,6 +355,7 @@ impl App {
         match result {
             Ok((payload, stats)) => {
                 self.login_required = false;
+                self.applied.push(request);
                 self.last_stats = Some((key.label(), stats));
                 match (payload, &key) {
                     (Payload::Courses(list), ResourceKey::Courses) => {

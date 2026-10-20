@@ -34,7 +34,12 @@ foreach ($task in ($Tasks -split ' ')) {
         'test'    { Step 'test' { cargo test --release } }
         'smoke'   { Step 'smoke' { & $exe --smoke } }
         'dump'    { Step 'dump' { & $exe --dump $dev } }
-        'pytest'  { Step 'pytest' { & $python -m unittest tools.test_auth_probe tools.test_auth_session tools.test_auth_ui } }
+        'pytest'  { Step 'pytest' { & $python -m unittest tools.test_auth_probe tools.test_auth_session tools.test_auth_ui tools.test_browser_bench } }
+        'bench'   { Step 'bench' { & $exe --bench 10 } }
+        'sysinfo' { Step 'sysinfo' { (Get-CimInstance Win32_Processor).Name; (Get-CimInstance Win32_OperatingSystem).Caption; '{0} GB RAM' -f [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB) } }
+        'bench-browser' { Step 'bench-browser' { & $python -m tools.browser_bench --runs 10 } }
+        # Draws to a real console window (opens one briefly) to include terminal output cost.
+        'bench-terminal' { Step 'bench-terminal' { Start-Process -FilePath $exe -ArgumentList '--bench', '5', '--terminal' -WorkingDirectory $root -Wait; Get-Content (Join-Path $root 'benchmarks\private\tui-bench-terminal.json') -TotalCount 12 } }
         'session' { Step 'session' { & $python -m tools.terminal_login --check } }
         'initial-commits' { Step 'initial-commits' { & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root '.tools\initial-commits.ps1') } }
         'gitident' { Step 'gitident' { 'name set: ' + [bool](git config --global user.name); 'email set: ' + [bool](git config --global user.email); git config --global user.name } }

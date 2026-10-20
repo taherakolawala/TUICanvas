@@ -73,8 +73,12 @@ impl CanvasError {
 pub struct FetchStats {
     pub requests: u32,
     pub bytes: usize,
-    /// Wall time from the first request start to the last response end.
+    /// Wall time from the first request start to the end of parsing.
     pub ms: f64,
+    /// Time spent waiting on the network (request sent to body received), summed over pages.
+    pub network_ms: f64,
+    /// Time spent turning response bodies into typed data, summed over pages.
+    pub parse_ms: f64,
 }
 
 pub struct CanvasClient {
@@ -256,6 +260,8 @@ impl CanvasClient {
     ) -> Result<(T, FetchStats), CanvasError> {
         let started = Instant::now();
         let response = self.exchange(Method::Get, path, None, false).await?;
+        let network_ms = elapsed_ms(started);
+        let parse_started = Instant::now();
         let value = parse_json(&response.body)?;
         Ok((
             value,
@@ -263,6 +269,8 @@ impl CanvasClient {
                 requests: 1,
                 bytes: response.body.len(),
                 ms: elapsed_ms(started),
+                network_ms,
+                parse_ms: elapsed_ms(parse_started),
             },
         ))
     }
@@ -282,11 +290,15 @@ impl CanvasClient {
             if stats.requests >= max_pages {
                 return Err(CanvasError::Invalid("too many pages"));
             }
+            let sent = Instant::now();
             let response = self.exchange(Method::Get, &current, None, false).await?;
+            stats.network_ms += elapsed_ms(sent);
             stats.requests += 1;
             stats.bytes += response.body.len();
+            let parse_started = Instant::now();
             let page: Vec<T> = parse_json(&response.body)?;
             items.extend(page);
+            stats.parse_ms += elapsed_ms(parse_started);
             if let Some(link) = response.header("link") {
                 next = next_link(link, &self.origin)?;
             }
@@ -314,14 +326,19 @@ impl CanvasClient {
         let started = Instant::now();
         let body = serde_json::to_vec(&serde_json::json!({"query": query, "variables": variables}))
             .map_err(|_| CanvasError::Invalid("could not encode query"))?;
+        let sent = Instant::now();
         let response = self
             .exchange(Method::Post, "/api/graphql", Some(body), send_csrf)
             .await?;
+        let network_ms = elapsed_ms(sent);
+        let parse_started = Instant::now();
         let mut value: Value = parse_json(&response.body)?;
         let stats = FetchStats {
             requests: 1,
             bytes: response.body.len(),
             ms: elapsed_ms(started),
+            network_ms,
+            parse_ms: elapsed_ms(parse_started),
         };
         if let Some(errors) = value
             .get("errors")

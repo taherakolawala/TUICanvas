@@ -246,6 +246,9 @@ pub async fn assignments_graphql(
             .await?;
         stats.requests += 1;
         stats.bytes += page_stats.bytes;
+        stats.network_ms += page_stats.network_ms;
+        stats.parse_ms += page_stats.parse_ms;
+        let convert_started = std::time::Instant::now();
         let page: GqlPage = data
             .pointer("/course/assignmentsConnection")
             .cloned()
@@ -255,6 +258,7 @@ pub async fn assignments_graphql(
                     .map_err(|_| CanvasError::Invalid("unexpected GraphQL shape"))
             })?;
         list.extend(page.nodes.into_iter().map(GqlAssignment::into_summary));
+        stats.parse_ms += convert_started.elapsed().as_secs_f64() * 1000.0;
         match (page.page_info.has_next_page, page.page_info.end_cursor) {
             (true, Some(cursor)) => after = Some(cursor),
             (true, None) => return Err(CanvasError::Invalid("pagination cursor missing")),

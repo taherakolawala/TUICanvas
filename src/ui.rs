@@ -835,6 +835,7 @@ mod tests {
                             requests: 1,
                             bytes: 14_200,
                             ms: 212.0,
+                            ..Default::default()
                         },
                     )),
                     at: Utc::now(),
@@ -1090,6 +1091,7 @@ mod preview {
                             requests: 1,
                             bytes: 7_644,
                             ms: 441.0,
+                            ..Default::default()
                         },
                     )),
                     at: Utc::now(),

@@ -57,6 +57,25 @@ impl Diagnostics {
         recent.push(exchange);
     }
 
+    pub fn enabled(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Append a timing event (no content) to the diagnostics file, if enabled.
+    pub fn event(&self, mut value: serde_json::Value) {
+        let Some(path) = &self.file else { return };
+        if let Some(map) = value.as_object_mut() {
+            map.insert("at_ms".into(), serde_json::json!(epoch_ms()));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{value}");
+        }
+    }
+
     pub fn recent(&self) -> Vec<Exchange> {
         self.recent
             .lock()
