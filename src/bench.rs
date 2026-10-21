@@ -93,6 +93,10 @@ fn current_has_data(app: &App) -> bool {
             .details
             .get(&(course_id.clone(), assignment_id.clone()))
             .is_some_and(|r| r.data.is_some()),
+        ViewKind::Files { course_id, .. } => app
+            .course_files
+            .get(course_id)
+            .is_some_and(|r| r.data.is_some()),
     }
 }
 
@@ -181,6 +185,10 @@ fn find_row(app: &App, needle: &str) -> Option<usize> {
                 .and_then(|r| r.data.as_ref())
                 .is_some_and(|l| l[i].title().to_lowercase().contains(&needle)),
             ViewKind::Detail { .. } => false,
+            ViewKind::Files { .. } => app
+                .file_rows()
+                .get(i)
+                .is_some_and(|r| r.name().to_lowercase().contains(&needle)),
         })
 }
 

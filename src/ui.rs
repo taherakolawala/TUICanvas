@@ -9,9 +9,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, DetailRender, Origin, Resource, SyncState, ViewKind};
-use crate::html;
-use crate::model::{AssignmentDetail, AssignmentSummary, Tone, fmt_num};
+use crate::app::{
+    App, DetailRender, FileRow, Local as LocalFile, Origin, Resource, SyncState, ViewKind,
+    human_size,
+};
+use crate::html::{self, Link, Target};
+use crate::model::{AssignmentDetail, AssignmentSummary, CanvasFile, Tone, fmt_num};
 use crate::theme;
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -109,7 +112,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.view().kind.clone() {
         ViewKind::Courses => draw_courses(frame, main, app),
         ViewKind::Assignments { course_id, .. } => {
-            draw_assignments(frame, main, app, &course_id, now)
+            let [tabs, body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+            draw_tabs(frame, tabs, false);
+            draw_assignments(frame, body, app, &course_id, now)
+        }
+        ViewKind::Files { course_id, .. } => {
+            let [tabs, body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+            draw_tabs(frame, tabs, true);
+            draw_files(frame, body, app, &course_id, now)
         }
         ViewKind::Detail {
             course_id,
@@ -196,6 +208,19 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
                 now,
             )
         }
+        ViewKind::Files {
+            course_id,
+            course_name,
+            ..
+        } => {
+            crumbs.push(course_name.clone());
+            crumbs.push("Files".into());
+            let path = app.folder_path();
+            if !path.is_empty() {
+                crumbs.extend(path.split(" / ").map(str::to_string));
+            }
+            sync_text(app.course_files.get(course_id), app.spinner, now)
+        }
     };
     let width = usize::from(area.width);
     let status = truncate(&status, width.saturating_sub(12).max(10));
@@ -273,6 +298,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ViewKind::Courses => &[
                 ("↑↓", "move"),
                 ("Enter", "open"),
+                ("e", "your files"),
                 ("/", "filter"),
                 ("r", "refresh"),
                 ("o", "browser"),
@@ -281,12 +307,52 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ViewKind::Assignments { .. } => &[
                 ("↑↓", "move"),
                 ("Enter", "open"),
+                ("Tab", "files"),
                 ("Esc", "back"),
                 ("/", "filter"),
                 ("r", "refresh"),
                 ("o", "browser"),
                 ("q", "quit"),
             ],
+            ViewKind::Files { .. } => &[
+                ("Enter", "open"),
+                ("d", "download"),
+                ("D", "all"),
+                ("e", "folder"),
+                ("/", "search"),
+                ("Tab", "assignments"),
+                ("Esc", "back"),
+                ("o", "browser"),
+                ("r", "refresh"),
+            ],
+            ViewKind::Detail {
+                ref course_id,
+                ref assignment_id,
+                ..
+            } if !app.links_of(course_id, assignment_id).is_empty() => {
+                if view.link.is_some() {
+                    &[
+                        ("Tab", "next"),
+                        ("Enter", "open"),
+                        ("d", "download"),
+                        ("D", "all files"),
+                        ("e", "show folder"),
+                        ("o", "browser"),
+                        ("Esc", "done"),
+                        ("↑↓", "scroll"),
+                    ]
+                } else {
+                    &[
+                        ("↑↓", "scroll"),
+                        ("Tab", "files & links"),
+                        ("D", "download files"),
+                        ("Esc", "back"),
+                        ("r", "refresh"),
+                        ("o", "open in browser"),
+                        ("q", "quit"),
+                    ]
+                }
+            }
             ViewKind::Detail { .. } => &[
                 ("↑↓", "scroll"),
                 ("Esc", "back"),
@@ -304,18 +370,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         spans.extend(hint_spans(hints));
         spans
     };
-    let stats = app
-        .last_stats
-        .as_ref()
-        .map(|(label, s)| {
-            format!(
-                "{label} {} req · {:.1} KB · {:.0} ms",
-                s.requests,
-                s.bytes as f64 / 1024.0,
-                s.ms
-            )
-        })
-        .unwrap_or_default();
+    let (queued, running) = app.transfer_counts();
+    let (stats, stats_style) = if queued + running > 0 {
+        let mut text = format!("downloading {}", running.max(1));
+        if queued > 0 {
+            text.push_str(&format!(" · {queued} queued"));
+        }
+        (text, theme::notice())
+    } else {
+        let text = app
+            .last_stats
+            .as_ref()
+            .map(|(label, s)| {
+                format!(
+                    "{label} {} req · {:.1} KB · {:.0} ms",
+                    s.requests,
+                    s.bytes as f64 / 1024.0,
+                    s.ms
+                )
+            })
+            .unwrap_or_default();
+        (text, theme::faint())
+    };
     let width = usize::from(area.width);
     let left_w: usize = left.iter().map(|s| s.content.width()).sum();
     let stats = if left_w + stats.width() + 2 <= width {
@@ -326,7 +402,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let fill = width.saturating_sub(left_w + stats.width());
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(fill)));
-    spans.push(Span::styled(stats, theme::faint()));
+    spans.push(Span::styled(stats, stats_style));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -542,6 +618,345 @@ fn draw_assignments(
     );
 }
 
+/// `Assignments  Files` for a course, the current one highlighted.
+fn draw_tabs(frame: &mut Frame, area: Rect, files: bool) {
+    let tab = |label: &str, on: bool| {
+        Span::styled(
+            label.to_string(),
+            if on {
+                theme::tab_active()
+            } else {
+                theme::muted()
+            },
+        )
+    };
+    let spans = vec![
+        Span::raw(" "),
+        tab("Assignments", !files),
+        Span::styled(" │ ", theme::faint()),
+        tab("Files", files),
+        Span::styled("   Tab", theme::key()),
+        Span::styled(" switch", theme::faint()),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn parse_time(text: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text?)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// What the "On this PC" column says about a file.
+fn local_text(state: &LocalFile) -> (String, Style) {
+    match state {
+        LocalFile::Missing => (String::new(), theme::faint()),
+        LocalFile::Saved => ("saved".into(), theme::tone(Tone::Good)),
+        LocalFile::Changed => ("newer on Canvas".into(), theme::tone(Tone::Warn)),
+        LocalFile::Queued => ("queued".into(), theme::muted()),
+        LocalFile::Running { received, total } => (
+            match total {
+                Some(t) if *t > 0 => format!("{}%", (received * 100 / t).min(100)),
+                _ => human_size(*received),
+            },
+            theme::key(),
+        ),
+        LocalFile::Failed(_) => ("failed".into(), theme::error()),
+        LocalFile::Locked => ("locked".into(), theme::faint()),
+    }
+}
+
+fn draw_files(frame: &mut Frame, area: Rect, app: &mut App, course_id: &str, now: DateTime<Utc>) {
+    if placeholder(frame, area, app.course_files.get(course_id), "files") {
+        return;
+    }
+    let hidden = app
+        .course_files
+        .get(course_id)
+        .and_then(|r| r.data.as_ref())
+        .is_some_and(|d| d.files.is_none());
+    if hidden {
+        let lines = vec![
+            Line::styled(
+                "The instructor has hidden Files for this course.",
+                theme::muted(),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "Files linked from assignments still open from the assignment.",
+                theme::faint(),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).alignment(Alignment::Center),
+            Rect {
+                y: area.y + area.height / 3,
+                height: area.height.saturating_sub(area.height / 3),
+                ..area
+            },
+        );
+        return;
+    }
+    let count = app.file_rows().len();
+    if count == 0 {
+        let filter = app.view().filter.clone();
+        empty_message(
+            frame,
+            area,
+            &filter,
+            if filter.is_empty() {
+                "files in this folder"
+            } else {
+                "files"
+            },
+        );
+        return;
+    }
+    let (start, end) = window(app, count, usize::from(area.height.saturating_sub(1)));
+    let selected = app.view().selected;
+    let searching = !app.view().filter.is_empty();
+    let rows = app.file_rows();
+    let built: Vec<Row> = rows[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let cells = match row {
+                FileRow::Folder(f) => {
+                    let locked = f.locked_for_user == Some(true);
+                    vec![
+                        Cell::from("DIR").style(theme::accent()),
+                        Cell::from(format!("{}/", html::sanitize(row.name()))).style(theme::bold()),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(if locked { "locked" } else { "" }).style(theme::faint()),
+                    ]
+                }
+                FileRow::File(f) => {
+                    let (state, style) = local_text(&app.local_state(f));
+                    let mut name = Vec::new();
+                    if searching
+                        && let Some(path) = f
+                            .folder_id
+                            .as_deref()
+                            .and_then(|id| app.folder(course_id, id))
+                            .and_then(|d| d.full_name.as_deref())
+                            .map(|full| full.split('/').skip(1).collect::<Vec<_>>().join(" / "))
+                            .filter(|p| !p.is_empty())
+                    {
+                        name.push(Span::styled(
+                            format!("{} / ", html::sanitize(&path)),
+                            theme::faint(),
+                        ));
+                    }
+                    name.push(Span::raw(html::sanitize(f.name())));
+                    vec![
+                        Cell::from(f.kind()).style(theme::code()),
+                        Cell::from(Line::from(name)),
+                        Cell::from(f.size.map(human_size).unwrap_or_default())
+                            .style(theme::muted()),
+                        Cell::from(
+                            parse_time(f.modified_at.as_deref().or(f.updated_at.as_deref()))
+                                .map(|t| short_date(t, now))
+                                .unwrap_or_default(),
+                        )
+                        .style(theme::faint()),
+                        Cell::from(state).style(style),
+                    ]
+                }
+            };
+            let row = Row::new(cells);
+            if start + i == selected {
+                row.style(theme::selected())
+            } else {
+                row
+            }
+        })
+        .collect();
+    let widths = if area.width >= 100 {
+        vec![
+            Constraint::Length(4),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(20),
+            Constraint::Length(15),
+        ]
+    } else if area.width >= 70 {
+        vec![
+            Constraint::Length(4),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(0),
+            Constraint::Length(15),
+        ]
+    } else {
+        vec![
+            Constraint::Length(4),
+            Constraint::Fill(1),
+            Constraint::Length(0),
+            Constraint::Length(0),
+            Constraint::Length(9),
+        ]
+    };
+    let header = Row::new(vec![
+        "",
+        if searching {
+            "Name (whole course)"
+        } else {
+            "Name"
+        },
+        "Size",
+        "Updated",
+        "On this PC",
+    ])
+    .style(theme::table_header());
+    frame.render_widget(
+        Table::new(built, widths).header(header).column_spacing(1),
+        area,
+    );
+}
+
+/// One row of an assignment's files & links list: kind, name, size, state.
+fn link_row(app: &App, link: &Link) -> (String, String, String, (String, Style)) {
+    match &link.target {
+        Target::File { id } => {
+            let meta: Option<&CanvasFile> = app.file_meta(id);
+            let kind = meta
+                .map(|f| f.kind())
+                .unwrap_or(if link.image { "IMG" } else { "FILE" });
+            let name = meta
+                .map(|f| f.name().to_string())
+                .filter(|_| !link.image || link.text.is_empty())
+                .unwrap_or_else(|| {
+                    if link.text.is_empty() {
+                        "file".into()
+                    } else {
+                        link.text.clone()
+                    }
+                });
+            let size = meta
+                .and_then(|f| f.size)
+                .map(human_size)
+                .unwrap_or_default();
+            let state = match (meta, app.files.get(id).map(|r| &r.sync)) {
+                (Some(f), _) => local_text(&app.local_state(f)),
+                (None, Some(SyncState::Failed(_))) => ("no access".into(), theme::error()),
+                (None, _) => ("…".into(), theme::faint()),
+            };
+            (kind.into(), name, size, state)
+        }
+        Target::Assignment { .. } => (
+            "ASGN".into(),
+            link.text.clone(),
+            String::new(),
+            ("opens here".into(), theme::faint()),
+        ),
+        Target::Canvas => (
+            "PAGE".into(),
+            link.text.clone(),
+            String::new(),
+            ("Canvas page".into(), theme::faint()),
+        ),
+        Target::Web => {
+            let host = link
+                .url
+                .split("://")
+                .nth(1)
+                .and_then(|r| r.split(['/', '?', '#']).next())
+                .unwrap_or("")
+                .trim_start_matches("www.")
+                .to_string();
+            let name = if link.text.is_empty() {
+                link.url.clone()
+            } else {
+                link.text.clone()
+            };
+            ("WEB".into(), name, String::new(), (host, theme::faint()))
+        }
+        Target::Mail => {
+            let to = link
+                .url
+                .trim_start_matches("mailto:")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (
+                "MAIL".into(),
+                if link.text.is_empty() {
+                    to.clone()
+                } else {
+                    link.text.clone()
+                },
+                String::new(),
+                (to, theme::faint()),
+            )
+        }
+    }
+}
+
+fn draw_links(frame: &mut Frame, area: Rect, app: &App, links: &[Link], selected: Option<usize>) {
+    let [title, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let mut head = vec![Span::styled(
+        format!(" Files & links ({})", links.len()),
+        theme::heading(),
+    )];
+    if selected.is_none() {
+        head.push(Span::styled("  Tab", theme::key()));
+        head.push(Span::styled(" to select", theme::faint()));
+    }
+    let rule = usize::from(area.width)
+        .saturating_sub(head.iter().map(|s| s.content.width()).sum::<usize>() + 1);
+    head.push(Span::styled(
+        format!(" {}", "─".repeat(rule)),
+        theme::faint(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(head)), title);
+    let height = usize::from(list.height).max(1);
+    let offset = selected
+        .map(|s| s.saturating_sub(height - 1))
+        .unwrap_or(0)
+        .min(links.len().saturating_sub(height));
+    let rows: Vec<Row> = links
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(i, link)| {
+            let (kind, name, size, (state, style)) = link_row(app, link);
+            let row = Row::new(vec![
+                Cell::from(format!("{:>2}", i + 1)).style(theme::key()),
+                Cell::from(kind).style(theme::code()),
+                Cell::from(html::sanitize(&name)),
+                Cell::from(size).style(theme::muted()),
+                Cell::from(html::sanitize(&state)).style(style),
+            ]);
+            if Some(i) == selected {
+                row.style(theme::selected())
+            } else {
+                row
+            }
+        })
+        .collect();
+    let widths = if area.width >= 70 {
+        vec![
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(18),
+        ]
+    } else {
+        vec![
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Fill(1),
+            Constraint::Length(0),
+            Constraint::Length(10),
+        ]
+    };
+    frame.render_widget(Table::new(rows, widths).column_spacing(1), list);
+}
+
 fn detail_header(d: &AssignmentDetail, course: &str, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let a = &d.base;
     let label = |s: &str| Span::styled(format!("{s:<12}"), theme::muted());
@@ -662,7 +1077,10 @@ fn style_inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if !plain.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut plain), base));
             }
-            spans.push(Span::styled(after[..close].to_string(), theme::link()));
+            spans.push(Span::styled(
+                after[..close].replace("**", ""),
+                theme::link(),
+            ));
             spans.push(Span::styled(
                 after[close + 1..close + 3 + num_end].to_string(),
                 theme::faint(),
@@ -742,6 +1160,25 @@ fn draw_detail(
     if placeholder(frame, area, app.details.get(&key), "assignment") {
         return;
     }
+    // Files and links get a fixed list at the bottom, so they stay in view while reading.
+    let links = app.links_of(course_id, assignment_id);
+    let area = if links.is_empty() {
+        area
+    } else {
+        let cap = if area.height >= 24 {
+            6
+        } else if area.height >= 16 {
+            4
+        } else {
+            2
+        };
+        let rows = links.len().min(cap) as u16;
+        let [text, panel] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(rows + 1)]).areas(area);
+        let selected = app.view().link.filter(|&i| i < links.len());
+        draw_links(frame, panel, app, &links, selected);
+        text
+    };
     let res = &app.details[&key];
     let detail = res.data.as_ref().expect("checked");
     let text_width = area.width.saturating_sub(2).min(110);
@@ -1018,6 +1455,7 @@ mod tests {
 mod preview {
     use super::*;
     use crate::app::{Effect, Msg, Payload};
+    use crate::cache::ResourceKey;
     use crate::canvas::FetchStats;
     use crate::model::{AssignmentSummary, Course, Submission, Term};
     use ratatui::Terminal;
@@ -1180,29 +1618,181 @@ mod preview {
         app.update(down());
         app.update(down());
         page += &html(&mut app, 104, 9);
+        // The assignment, with its files & links list. A temporary library
+        // shows each local state: saved, not saved, downloading.
+        let root = std::env::temp_dir().join(format!("tuicanvas-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = std::sync::Arc::new(crate::library::Library::open(&root, "ufl.instructure.com"));
+        app.library = Some(lib.clone());
+        let file =
+            |id: &str, name: &str, ct: &str, size: u64, folder: &str| crate::model::CanvasFile {
+                id: id.into(),
+                display_name: Some(name.into()),
+                content_type: Some(ct.into()),
+                size: Some(size),
+                updated_at: Some("2026-10-14T15:20:00Z".into()),
+                url: Some(format!(
+                    "https://ufl.instructure.com/files/{id}/download?verifier=v"
+                )),
+                folder_id: Some(folder.into()),
+                ..Default::default()
+            };
+        let save = |f: &crate::model::CanvasFile, dir: &std::path::Path| {
+            let part = lib.temp_dir().join(&f.id);
+            std::fs::create_dir_all(lib.temp_dir()).unwrap();
+            std::fs::write(&part, "x").unwrap();
+            lib.install(&f.id, &part, f.version(), &dir.join(f.name()), false)
+                .unwrap();
+        };
         let effects = app.update(enter());
         let detail = crate::model::AssignmentDetail {
             base: a("12", "Lab-2 Assignment", 7, Some(Submission::default())),
-            description: Some("<h2>Overview</h2><p>Implement the tiled matrix multiply from lecture. The requirements are in the <a href=\"/courses/1/files/9/download\">Lab-2 slides</a>; submit a <strong>zip</strong> of your code.</p><ol><li>Implement the kernel</li><li>Report timings for three sizes</li></ol>".into()),
+            description: Some(concat!(
+                "<h2>Overview</h2><p>Implement the tiled matrix multiply from lecture. The requirements are in the ",
+                "<a href=\"/courses/1/files/9/download?verifier=x\">Lab-2 slides</a>; start from the ",
+                "<a href=\"/courses/1/files/10/download\">starter code</a> and read ",
+                "<a href=\"https://docs.nvidia.com/cuda/cuda-c-programming-guide/\">the CUDA guide</a>.</p>",
+                "<p><img src=\"/courses/1/files/11/preview\" alt=\"Expected speedup\"></p>",
+                "<ol><li>Implement the kernel</li><li>Report timings for three sizes, as in ",
+                "<a href=\"/courses/1/assignments/10\">Lab-1</a></li></ol>",
+                "<p>Questions? <a href=\"mailto:ta@ufl.edu\">Email the TA</a>.</p>"
+            ).into()),
             allowed_attempts: Some(2),
             ..Default::default()
         };
-        deliver(&mut app, effects, Payload::Detail(Box::new(detail)));
-        page += &html(&mut app, 104, 22);
-        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let effects = {
+            let mut later = Vec::new();
+            for e in effects {
+                if let Effect::Fetch { key, request } = e {
+                    later.extend(app.update(Msg::Fetched {
+                        key,
+                        request,
+                        result: Ok((
+                            Payload::Detail(Box::new(detail.clone())),
+                            FetchStats {
+                                requests: 1,
+                                bytes: 4_610,
+                                ms: 268.0,
+                                ..Default::default()
+                            },
+                        )),
+                        at: Utc::now(),
+                    }));
+                }
+            }
+            later
+        };
+        let slides = file("9", "Lab-2 slides.pdf", "application/pdf", 1_284_000, "1");
+        let assignment_dir = lib.assignment_dir("EEL6763 GPU Computing", "Lab-2 Assignment");
+        save(&slides, &assignment_dir);
+        for e in effects {
+            if let Effect::Fetch {
+                key: ResourceKey::File(id),
+                request,
+            } = e
+            {
+                let meta = match id.as_str() {
+                    "9" => slides.clone(),
+                    "10" => file("10", "lab2-starter.zip", "application/zip", 48_200, "1"),
+                    _ => file("11", "speedup.png", "image/png", 96_000, "1"),
+                };
+                app.update(Msg::Fetched {
+                    key: ResourceKey::File(id),
+                    request,
+                    result: Ok((Payload::File(Box::new(meta)), FetchStats::default())),
+                    at: Utc::now(),
+                });
+            }
+        }
+        app.update(Msg::Transfer {
+            file_id: "11".into(),
+            event: crate::app::TransferEvent::Progress {
+                received: 41_000,
+                total: Some(96_000),
+            },
+        });
+        let tab = || Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.notice = None;
+        page += &html(&mut app, 104, 26);
+        app.update(tab());
+        app.update(tab());
+        page += &html(&mut app, 104, 26);
+
+        // The course's Files tab.
+        let esc = || Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(esc());
+        app.update(esc());
+        let effects = app.update(tab());
+        let folder = |id: &str, full: &str, parent: Option<&str>| crate::model::CanvasFolder {
+            id: id.into(),
+            name: full.rsplit('/').next().map(str::to_string),
+            full_name: Some(full.into()),
+            parent_folder_id: parent.map(str::to_string),
+            ..Default::default()
+        };
+        let syllabus = file(
+            "20",
+            "Syllabus Fall 2026.pdf",
+            "application/pdf",
+            212_000,
+            "1",
+        );
+        let mut schedule = file(
+            "21",
+            "Course schedule.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            18_400,
+            "1",
+        );
+        let class_dir = lib.class_files_dir("EEL6763 GPU Computing");
+        save(&syllabus, &class_dir);
+        save(&schedule, &class_dir);
+        schedule.updated_at = Some("2026-10-20T09:05:00Z".into());
+        let listing = crate::app::CourseFilesData {
+            folders: vec![
+                folder("1", "course files", None),
+                folder("2", "course files/Lectures", Some("1")),
+                folder("3", "course files/Labs", Some("1")),
+                folder("4", "course files/Exams", Some("1")),
+            ],
+            files: Some(vec![
+                syllabus,
+                schedule,
+                file("22", "Lab-2 slides.pdf", "application/pdf", 1_284_000, "1"),
+                file(
+                    "23",
+                    "CUDA cheat sheet.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    64_000,
+                    "1",
+                ),
+                file(
+                    "24",
+                    "Lecture 07 - Tiling.pptx",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    8_900_000,
+                    "2",
+                ),
+            ]),
+        };
+        deliver(&mut app, effects, Payload::Files(Box::new(listing)));
+        for _ in 0..5 {
+            app.update(down());
+        }
         app.update(Msg::Key(KeyEvent::new(
-            KeyCode::Char('/'),
+            KeyCode::Char('d'),
             KeyModifiers::NONE,
         )));
-        app.update(Msg::Key(KeyEvent::new(
-            KeyCode::Char('l'),
-            KeyModifiers::NONE,
-        )));
-        app.update(Msg::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        )));
-        page += &html(&mut app, 104, 9);
+        app.update(Msg::Transfer {
+            file_id: "22".into(),
+            event: crate::app::TransferEvent::Progress {
+                received: 530_000,
+                total: Some(1_284_000),
+            },
+        });
+        app.notice = None;
+        page += &html(&mut app, 104, 12);
+        let _ = std::fs::remove_dir_all(&root);
         page += "</body></html>";
         std::fs::write(path, page).unwrap();
     }

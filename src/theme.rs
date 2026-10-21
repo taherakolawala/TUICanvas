@@ -106,6 +106,15 @@ pub fn selected() -> Style {
         Style::new().bg(SELECT_BG).add_modifier(Modifier::BOLD)
     }
 }
+pub fn tab_active() -> Style {
+    if plain() {
+        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::new()
+            .fg(ORANGE)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
+}
 pub fn table_header() -> Style {
     fg(ORANGE).add_modifier(Modifier::BOLD)
 }

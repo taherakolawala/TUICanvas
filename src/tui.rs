@@ -12,17 +12,24 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::Semaphore;
 
 use crate::api;
-use crate::app::{App, Effect, Msg, Payload};
+use crate::app::{App, CourseFilesData, Effect, Msg, Payload, TransferEvent};
 use crate::cache::{ResourceKey, SnapshotStore};
 use crate::canvas::CanvasClient;
 use crate::config::Config;
 use crate::diag::Diagnostics;
+use crate::download::{DownloadError, Downloader};
+use crate::library::Library;
+use crate::model::CanvasFile;
 use crate::session::SessionFile;
 use crate::transport::ReqwestTransport;
 use crate::ui;
 
 /// Starting value from the plan: at most four network operations at once.
 const MAX_CONCURRENT: usize = 4;
+/// File downloads at once, separate from reads so a large download never blocks a screen.
+const MAX_DOWNLOADS: usize = 2;
+/// At most this often a download reports progress to the screen.
+const PROGRESS_EVERY: Duration = Duration::from_millis(120);
 
 pub struct Options {
     pub diag_file: Option<std::path::PathBuf>,
@@ -38,6 +45,9 @@ pub(crate) struct Executor {
     session: Arc<Mutex<SessionFile>>,
     session_path: std::path::PathBuf,
     limit: Arc<Semaphore>,
+    downloads: Arc<Semaphore>,
+    downloader: Option<Arc<Downloader>>,
+    pub(crate) library: Arc<Library>,
     tx: Sender<Msg>,
 }
 
@@ -65,6 +75,16 @@ impl Executor {
                 ResourceKey::Detail(c, a) => api::assignment(&client, c, a)
                     .await
                     .map(|(v, s)| (Payload::Detail(Box::new(v)), s)),
+                ResourceKey::Files(c) => api::course_files(&client, c).await.map(|(v, s)| {
+                    let data = CourseFilesData {
+                        folders: v.folders,
+                        files: v.files,
+                    };
+                    (Payload::Files(Box::new(data)), s)
+                }),
+                ResourceKey::File(f) => api::file(&client, f)
+                    .await
+                    .map(|(v, s)| (Payload::File(Box::new(v)), s)),
             };
             let at = Utc::now();
             if let Ok((payload, _)) = &result {
@@ -72,6 +92,8 @@ impl Executor {
                     Payload::Courses(v) => store.save(&key, v, at),
                     Payload::Assignments(v) => store.save(&key, v, at),
                     Payload::Detail(v) => store.save(&key, v.as_ref(), at),
+                    Payload::Files(v) => store.save(&key, v.as_ref(), at),
+                    Payload::File(v) => store.save(&key, v.as_ref(), at),
                 }
             }
             persist_rotated_cookies(&client, &session, &session_path);
@@ -83,6 +105,148 @@ impl Executor {
             });
         });
     }
+}
+
+impl Executor {
+    /// Download a file into the library's partial folder, then install it at
+    /// `target`. Progress, completion and failure arrive as `Msg::Transfer`.
+    pub(crate) fn download(&self, file: CanvasFile, target: std::path::PathBuf, automatic: bool) {
+        let tx = self.tx.clone();
+        let id = file.id.clone();
+        let send = move |event: TransferEvent| {
+            let _ = tx.send(Msg::Transfer {
+                file_id: id.clone(),
+                event,
+            });
+        };
+        let Some(downloader) = self.downloader.clone() else {
+            send(TransferEvent::Failed {
+                message: "downloads are unavailable".into(),
+                needs_login: false,
+            });
+            return;
+        };
+        let (client, library, slots, origin) = (
+            self.client.clone(),
+            self.library.clone(),
+            self.downloads.clone(),
+            self.client.origin().to_string(),
+        );
+        self.rt.spawn(async move {
+            let _slot = slots.acquire_owned().await;
+            let Some(url) = file.url.clone() else {
+                send(TransferEvent::Failed {
+                    message: "file is locked on Canvas".into(),
+                    needs_login: false,
+                });
+                return;
+            };
+            send(TransferEvent::Progress {
+                received: 0,
+                total: file.size,
+            });
+            let path = reqwest::Url::parse(&url)
+                .map(|u| u.path().to_string())
+                .unwrap_or_default();
+            let cookie = client.cookie_header(&path);
+            let partial = library.temp_dir().join(format!("{}.part", file.id));
+            let last = Mutex::new(Instant::now());
+            let progress = |received: u64, total: Option<u64>| {
+                let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+                if last.elapsed() >= PROGRESS_EVERY {
+                    *last = Instant::now();
+                    send(TransferEvent::Progress { received, total });
+                }
+            };
+            let fetched = downloader
+                .fetch(&url, cookie.as_deref(), &partial, &progress)
+                .await;
+            let outcome = match fetched {
+                Ok(_) => {
+                    mark_from_internet(&partial, &origin);
+                    let (lib, part, dest, version, fid) = (
+                        library.clone(),
+                        partial.clone(),
+                        target.clone(),
+                        file.version(),
+                        file.id.clone(),
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        lib.install(&fid, &part, version, &dest, automatic)
+                    })
+                    .await
+                    .map_err(|_| DownloadError::Disk)
+                    .and_then(|r| r.map_err(|_| DownloadError::Disk))
+                }
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(()) => send(TransferEvent::Done(target)),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&partial);
+                    send(TransferEvent::Failed {
+                        message: e.describe(),
+                        needs_login: e == DownloadError::NeedsLogin,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Remove auto-downloaded images unused for 30 days, off the UI thread.
+    pub(crate) fn evict_unused_files(&self) {
+        let library = self.library.clone();
+        self.rt
+            .spawn_blocking(move || library.evict_unused(Utc::now()));
+    }
+}
+
+/// Tag a downloaded file the way browsers do (Mark of the Web), so Windows
+/// and Office treat it as coming from the internet.
+fn mark_from_internet(path: &Path, origin: &str) {
+    #[cfg(windows)]
+    {
+        let stream = format!("{}:Zone.Identifier", path.display());
+        let _ = std::fs::write(
+            stream,
+            format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={origin}/\r\n"),
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (path, origin);
+}
+
+/// Show a file selected in its folder, or open a folder (created if missing).
+fn reveal(path: &Path) -> Result<(), ()> {
+    if path.is_file() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            return std::process::Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", path.display()))
+                .spawn()
+                .map(|_| ())
+                .map_err(|_| ());
+        }
+        #[cfg(not(windows))]
+        return open::that_detached(path.parent().unwrap_or(path)).map_err(|_| ());
+    }
+    std::fs::create_dir_all(path).map_err(|_| ())?;
+    open::that_detached(path).map_err(|_| ())
+}
+
+/// Addresses `o` and description links may open: web pages and email only.
+fn openable(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:"))
+        && !url
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '"')
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "the file".into())
 }
 
 pub(crate) fn persist_rotated_cookies(
@@ -219,6 +383,9 @@ pub(crate) fn build_executor(
         session: Arc::new(Mutex::new(session)),
         session_path: config.session_path(),
         limit: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+        downloads: Arc::new(Semaphore::new(MAX_DOWNLOADS)),
+        downloader: Downloader::new(&config.host).ok().map(Arc::new),
+        library: Arc::new(Library::open(&config.library_root(), &config.host)),
         tx,
     };
     Ok((executor, rx))
@@ -346,6 +513,8 @@ pub fn run(config: &Config, options: Options) -> Result<(), String> {
         mut account,
     } = setup(config, &options, true)?;
     let mut app = App::new(&config.origin, Some(executor.store.clone()));
+    app.library = Some(executor.library.clone());
+    executor.evict_unused_files();
     let input = Input::spawn(executor.tx.clone());
     let mut terminal =
         ratatui::try_init().map_err(|_| "Could not initialise the terminal.".to_string())?;
@@ -371,12 +540,41 @@ pub fn run(config: &Config, options: Options) -> Result<(), String> {
                     executor.fetch(key, request)
                 }
                 Effect::OpenUrl(url) => {
-                    // Only Canvas-origin URLs reach here (see App::browser_url).
-                    if url.starts_with(&format!("{}/", config.origin)) {
-                        app.notice = Some(match open::that_detached(&url) {
+                    app.notice = Some(if !openable(&url) {
+                        "That link is not a web page.".into()
+                    } else {
+                        match open::that_detached(&url) {
+                            Ok(()) if url.starts_with("mailto:") => "Opened your email app.".into(),
                             Ok(()) => "Opened in your browser.".into(),
                             Err(_) => "Could not open the browser.".into(),
-                        });
+                        }
+                    });
+                    app.dirty = true;
+                }
+                Effect::Download {
+                    file,
+                    target,
+                    automatic,
+                } => executor.download(*file, target, automatic),
+                Effect::OpenPath(path) => {
+                    let name = file_label(&path);
+                    app.notice = Some(if crate::library::is_program(&name) {
+                        // Never run downloaded programs; show them instead.
+                        let _ = reveal(&path);
+                        format!(
+                            "{name} is a program, so it was shown in its folder instead of opened."
+                        )
+                    } else {
+                        match open::that_detached(&path) {
+                            Ok(()) => format!("Opened {name}."),
+                            Err(_) => format!("No app is set to open {name}."),
+                        }
+                    });
+                    app.dirty = true;
+                }
+                Effect::Reveal(path) => {
+                    if reveal(&path).is_err() {
+                        app.notice = Some("Could not open the folder.".into());
                         app.dirty = true;
                     }
                 }
@@ -408,6 +606,7 @@ pub fn run(config: &Config, options: Options) -> Result<(), String> {
                                 executor.store =
                                     Arc::new(SnapshotStore::new(&config.cache_root(), &account));
                                 app = App::new(&config.origin, Some(executor.store.clone()));
+                                app.library = Some(executor.library.clone());
                             }
                             Msg::LoginFinished {
                                 ok: true,
@@ -489,8 +688,15 @@ pub fn dump(config: &Config, out: &Path, course: &str, assignment: &str) -> Resu
         diag_file: None,
         started: Instant::now(),
     };
-    let Setup { executor, rx, .. } = setup(config, &options, false)?;
+    let Setup {
+        mut executor, rx, ..
+    } = setup(config, &options, false)?;
     let mut app = App::new(&config.origin, Some(executor.store.clone()));
+    // Downloads go to a scratch library, never the user's.
+    let scratch = config.data_dir.join("dump-library");
+    let _ = std::fs::remove_dir_all(&scratch);
+    executor.library = Arc::new(Library::open(&scratch, &config.host));
+    app.library = Some(executor.library.clone());
     let (w, h) = (110u16, 34u16);
     app.size = (w, h);
     let mut terminal = Terminal::new(TestBackend::new(w, h)).map_err(|_| "backend")?;
@@ -541,7 +747,13 @@ pub fn dump(config: &Config, out: &Path, course: &str, assignment: &str) -> Resu
             match rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(m @ Msg::Fetched { .. }) => {
                     waiting -= 1;
-                    app.update(m);
+                    // Follow-up reads, such as the details of an assignment's files.
+                    for e in app.update(m) {
+                        if let Effect::Fetch { key, request } = e {
+                            executor.fetch(key, request);
+                            waiting += 1;
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => return Err(format!("{name}: timed out waiting for Canvas")),
@@ -590,6 +802,106 @@ pub fn dump(config: &Config, out: &Path, course: &str, assignment: &str) -> Resu
     step(&mut app, effects, "3-detail", &mut timings)?;
     let effects = app.update(press(KeyCode::Esc));
     step(&mut app, effects, "4-back-to-assignments", &mut timings)?;
+    let effects = app.update(press(KeyCode::Tab));
+    step(&mut app, effects, "5-files", &mut timings)?;
+    // Into the folder with the most files (no read: the listing covers the course).
+    let count = |folder: &str| {
+        app.course_files
+            .values()
+            .filter_map(|r| r.data.as_ref()?.files.as_ref())
+            .flatten()
+            .filter(|f| f.folder_id.as_deref() == Some(folder))
+            .count()
+    };
+    let busiest = app
+        .file_rows()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            crate::app::FileRow::Folder(f) => Some((count(&f.id), i)),
+            _ => None,
+        })
+        .max()
+        .filter(|(n, _)| *n > 0)
+        .map(|(_, i)| i);
+    if let Some(index) = busiest {
+        for _ in 0..index {
+            app.update(press(KeyCode::Down));
+        }
+        let effects = app.update(press(KeyCode::Enter));
+        step(&mut app, effects, "6-files-folder", &mut timings)?;
+    }
+    // One real download (the smallest file here) through the reader's own path.
+    let smallest = app
+        .file_rows()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            crate::app::FileRow::File(f) if f.url.is_some() && f.locked_for_user != Some(true) => {
+                Some((f.size.unwrap_or(u64::MAX), i))
+            }
+            _ => None,
+        })
+        .min()
+        .map(|(_, i)| i);
+    if let Some(index) = smallest {
+        app.update(press(KeyCode::Home));
+        for _ in 0..index {
+            app.update(press(KeyCode::Down));
+        }
+        let started = Instant::now();
+        let mut target = None;
+        for e in app.update(press(KeyCode::Char('d'))) {
+            if let Effect::Download {
+                file,
+                target: t,
+                automatic,
+            } = e
+            {
+                target = Some(t.clone());
+                executor.download(*file, t, automatic);
+            }
+        }
+        if let Some(target) = target {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(120)) {
+                    Ok(m @ Msg::Transfer { .. }) => {
+                        let finished = matches!(
+                            &m,
+                            Msg::Transfer {
+                                event: TransferEvent::Done(_) | TransferEvent::Failed { .. },
+                                ..
+                            }
+                        );
+                        app.update(m);
+                        if finished {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err("7-download: timed out".into()),
+                }
+            }
+            let ms = (started.elapsed().as_secs_f64() * 1000.0).round();
+            timings.insert("7-download_ms".into(), serde_json::json!(ms));
+            timings.insert(
+                "7-download_saved".into(),
+                serde_json::json!(target.is_file()),
+            );
+            timings.insert(
+                "7-download_marked_from_internet".into(),
+                serde_json::json!(
+                    std::fs::metadata(format!("{}:Zone.Identifier", target.display())).is_ok()
+                ),
+            );
+            timings.insert(
+                "7-download_notice".into(),
+                serde_json::json!(app.notice.is_some()),
+            );
+            render(&mut app, "7-download", &mut timings)?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
     std::fs::write(
         out.join("dump-timings.json"),
         serde_json::to_string_pretty(&timings).unwrap_or_default(),

@@ -188,6 +188,98 @@ pub fn run(config: &Config, opts: SmokeOptions) -> Result<i32, String> {
         steps.push(json!({"name": "detail_graphql", "outcome": outcome(&gql), "runs_ms": gql_ms.iter().map(|m| (m * 10.0).round() / 10.0).collect::<Vec<_>>(),
             "median_ms": (median(&mut gql_ms.clone()) * 10.0).round() / 10.0, "detail": gql_detail, "error": err_detail(&gql)}));
 
+        // 5b. Files: the course's Files area, one real attachment download into a
+        //     scratch library, and whether hard links work on this drive.
+        let listing = api::course_files(&client, &course.id).await;
+        steps.push(json!({"name": "course_files", "outcome": outcome(&listing),
+            "stats": listing.as_ref().ok().map(|(_, s)| stats_json(s)),
+            "folders": listing.as_ref().ok().map(|(l, _)| l.folders.len()),
+            "files": listing.as_ref().ok().map(|(l, _)| l.files.as_ref().map(Vec::len)),
+            "files_hidden": listing.as_ref().ok().map(|(l, _)| l.files.is_none()),
+            "error": err_detail(&listing)}));
+        let scratch = config.data_dir.join("smoke-library");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let library = crate::library::Library::open(&scratch, &config.host);
+        // An attachment linked from any assignment in this course, else any listed course file.
+        let mut candidate: Option<String> = None;
+        if let Ok((items, _)) = &list {
+            for a in items.iter().take(40) {
+                if let Ok((d, _)) = api::assignment(&client, &course.id, &a.id).await {
+                    let links = crate::html::links(d.description.as_deref().unwrap_or(""), &config.origin);
+                    if let Some(id) = links.iter().find_map(|l| match &l.target {
+                        crate::html::Target::File { id } if !l.image => Some(id.clone()),
+                        _ => None,
+                    }) {
+                        candidate = Some(id);
+                        break;
+                    }
+                }
+            }
+        }
+        // Access to every file linked from this course's assignments (metadata only).
+        let mut linked = Vec::new();
+        if let Ok((items, _)) = &list {
+            for a in items.iter().take(40) {
+                let Ok((d, _)) = api::assignment(&client, &course.id, &a.id).await else { continue };
+                for link in crate::html::links(d.description.as_deref().unwrap_or(""), &config.origin) {
+                    let crate::html::Target::File { id } = &link.target else { continue };
+                    let meta = api::file(&client, id).await;
+                    linked.push(match &meta {
+                        Ok((f, _)) => json!({"image": link.image, "metadata": "ok", "kind": f.kind(),
+                            "locked_for_user": f.locked_for_user, "has_url": f.url.is_some(),
+                            "lock_explanation": f.lock_explanation, "link_has_verifier": link.url.contains("verifier=")}),
+                        Err(_) => json!({"image": link.image, "metadata": outcome(&meta), "link_has_verifier": link.url.contains("verifier=")}),
+                    });
+                }
+            }
+        }
+        steps.push(json!({"name": "linked_file_access", "files": linked}));
+        let from_listing = candidate.is_none();
+        if candidate.is_none() {
+            candidate = listing.as_ref().ok().and_then(|(l, _)| l.files.as_ref())
+                .and_then(|f| f.iter().find(|f| f.url.is_some() && f.size.unwrap_or(0) < 20_000_000).map(|f| f.id.clone()));
+        }
+        let mut download = json!({"name": "attachment_download", "found_candidate": candidate.is_some(), "from_course_listing": from_listing});
+        if let Some(id) = candidate {
+            let meta = api::file(&client, &id).await;
+            download["metadata"] = outcome(&meta);
+            if let Ok((file, _)) = meta {
+                download["kind"] = json!(file.kind());
+                download["locked_for_user"] = json!(file.locked_for_user);
+                if let (Some(url), Ok(downloader)) = (file.url.clone(), crate::download::Downloader::new(&config.host)) {
+                    let path = reqwest::Url::parse(&url).map(|u| u.path().to_string()).unwrap_or_default();
+                    let cookie = client.cookie_header(&path);
+                    let partial = library.temp_dir().join(format!("{id}.part"));
+                    let started = Instant::now();
+                    let got = downloader.fetch(&url, cookie.as_deref(), &partial, &|_, _| {}).await;
+                    download["ms"] = json!((started.elapsed().as_secs_f64() * 1000.0).round());
+                    match got {
+                        Ok(bytes) => {
+                            download["outcome"] = json!("ok");
+                            download["bytes"] = json!(bytes);
+                            download["size_matches_canvas"] = json!(file.size == Some(bytes));
+                            let first = library.assignment_dir("Smoke", "Attachment").join(crate::library::safe_name(file.name()));
+                            let second = library.class_files_dir("Smoke").join(crate::library::safe_name(file.name()));
+                            let installed = library.install(&id, &partial, file.version(), &first, false).is_ok();
+                            if let Some(dir) = second.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            let probe = second.with_extension("linktest");
+                            let linked = std::fs::hard_link(&first, &probe).is_ok();
+                            let _ = std::fs::remove_file(&probe);
+                            let referenced = library.reference(&id, &second).unwrap_or(false);
+                            download["installed"] = json!(installed);
+                            download["hard_links_supported"] = json!(linked);
+                            download["second_place_same_size"] = json!(referenced && std::fs::metadata(&second).map(|m| m.len()).ok() == Some(bytes));
+                        }
+                        Err(e) => download["outcome"] = json!(e.describe()),
+                    }
+                }
+            }
+        }
+        steps.push(download);
+        let _ = std::fs::remove_dir_all(&scratch);
+
         // 6. Failure classification and CSRF requirement.
         let no_csrf = client.graphql_with(DETAIL_GQL, json!({"id": assignment.id}), false).await;
         steps.push(json!({"name": "graphql_without_csrf_header", "outcome": outcome(&no_csrf), "error": err_detail(&no_csrf)}));

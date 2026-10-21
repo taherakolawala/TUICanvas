@@ -13,6 +13,10 @@ pub enum ResourceKey {
     Courses,
     Assignments(String),
     Detail(String, String),
+    /// A course's Files area (folder tree and file list).
+    Files(String),
+    /// One Canvas file's metadata.
+    File(String),
 }
 
 impl ResourceKey {
@@ -24,6 +28,8 @@ impl ResourceKey {
             ResourceKey::Detail(c, a) if ok(c) && ok(a) => {
                 format!("assignment-{}-{}", c.replace('~', "_"), a.replace('~', "_"))
             }
+            ResourceKey::Files(c) if ok(c) => format!("files-{}", c.replace('~', "_")),
+            ResourceKey::File(f) if ok(f) => format!("file-{}", f.replace('~', "_")),
             _ => return None,
         };
         Some(name + ".json")
@@ -34,6 +40,8 @@ impl ResourceKey {
             ResourceKey::Courses => "courses",
             ResourceKey::Assignments(_) => "assignments",
             ResourceKey::Detail(..) => "assignment",
+            ResourceKey::Files(_) => "files",
+            ResourceKey::File(_) => "file",
         }
     }
 }

@@ -74,6 +74,49 @@ pub async fn assignment(
         .await
 }
 
+pub async fn file(
+    client: &CanvasClient,
+    file_id: &str,
+) -> Result<(model::CanvasFile, FetchStats), CanvasError> {
+    check(file_id)?;
+    client.get_json(&format!("/api/v1/files/{file_id}")).await
+}
+
+/// A course's Files area: the folder tree and every file in it, read in
+/// parallel. Courses that hide Files from students refuse the file list.
+pub struct CourseFiles {
+    pub folders: Vec<model::CanvasFolder>,
+    /// `None` when the instructor hides Files from students.
+    pub files: Option<Vec<model::CanvasFile>>,
+}
+
+pub async fn course_files(
+    client: &CanvasClient,
+    course_id: &str,
+) -> Result<(CourseFiles, FetchStats), CanvasError> {
+    check(course_id)?;
+    let folders_path = format!("/api/v1/courses/{course_id}/folders?per_page=100");
+    let files_path = format!("/api/v1/courses/{course_id}/files?per_page=100");
+    let (folders, files) = tokio::join!(
+        client.get_all_pages::<model::CanvasFolder>(&folders_path, 20),
+        client.get_all_pages::<model::CanvasFile>(&files_path, 50)
+    );
+    let (folders, mut stats) = folders?;
+    let files = match files {
+        Ok((files, s)) => {
+            stats.requests += s.requests;
+            stats.bytes += s.bytes;
+            stats.network_ms = stats.network_ms.max(s.network_ms);
+            stats.parse_ms += s.parse_ms;
+            stats.ms = stats.ms.max(s.ms);
+            Some(files)
+        }
+        Err(CanvasError::NoAccess(_)) => None,
+        Err(e) => return Err(e),
+    };
+    Ok((CourseFiles { folders, files }, stats))
+}
+
 #[derive(serde::Deserialize)]
 pub struct Profile {
     #[serde(deserialize_with = "de_u64")]

@@ -129,6 +129,140 @@ pub struct AssignmentDetail {
     pub grading_type: Option<String>,
 }
 
+/// A Canvas file's metadata (`/api/v1/files/:id`, course file listings).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CanvasFile {
+    #[serde(deserialize_with = "de_id")]
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(rename = "content-type", default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+    /// Signed download address; absent when the file is locked for the user.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_id")]
+    pub folder_id: Option<String>,
+    #[serde(default)]
+    pub locked_for_user: Option<bool>,
+    /// Canvas's reason, e.g. "This file is locked until Sep 3 at 12am."
+    #[serde(default)]
+    pub lock_explanation: Option<String>,
+}
+
+impl CanvasFile {
+    pub fn name(&self) -> &str {
+        self.display_name
+            .as_deref()
+            .or(self.filename.as_deref())
+            .unwrap_or("file")
+    }
+
+    /// Short kind label from the content type or extension.
+    pub fn kind(&self) -> &'static str {
+        file_kind(self.content_type.as_deref().unwrap_or(""), self.name())
+    }
+
+    pub fn version(&self) -> crate::library::FileVersion {
+        crate::library::FileVersion {
+            updated_at: self.modified_at.clone().or(self.updated_at.clone()),
+            size: self.size,
+        }
+    }
+}
+
+pub fn file_kind(content_type: &str, name: &str) -> &'static str {
+    let ct = content_type.to_ascii_lowercase();
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ct.contains("pdf") || ext == "pdf" {
+        "PDF"
+    } else if ct.starts_with("image/")
+        || matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+        )
+    {
+        "IMG"
+    } else if ct.contains("word") || matches!(ext.as_str(), "doc" | "docx") {
+        "DOC"
+    } else if ct.contains("presentation")
+        || ct.contains("powerpoint")
+        || matches!(ext.as_str(), "ppt" | "pptx")
+    {
+        "PPT"
+    } else if ct.contains("sheet")
+        || ct.contains("excel")
+        || matches!(ext.as_str(), "xls" | "xlsx" | "csv")
+    {
+        "XLS"
+    } else if ct.contains("zip") || matches!(ext.as_str(), "zip" | "tar" | "gz" | "7z" | "rar") {
+        "ZIP"
+    } else if ct.starts_with("video/") || ct.starts_with("audio/") {
+        "AV"
+    } else if ct.starts_with("text/")
+        || matches!(
+            ext.as_str(),
+            "txt"
+                | "md"
+                | "py"
+                | "c"
+                | "cpp"
+                | "cu"
+                | "h"
+                | "java"
+                | "rs"
+                | "js"
+                | "ipynb"
+                | "json"
+        )
+    {
+        "TXT"
+    } else {
+        "FILE"
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CanvasFolder {
+    #[serde(deserialize_with = "de_id")]
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Path from the course root, e.g. `course files/Lectures`.
+    #[serde(default)]
+    pub full_name: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_id")]
+    pub parent_folder_id: Option<String>,
+    #[serde(default)]
+    pub locked_for_user: Option<bool>,
+    #[serde(default)]
+    pub hidden_for_user: Option<bool>,
+}
+
+fn de_opt_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        S(String),
+        N(u64),
+    }
+    Ok(Option::<Id>::deserialize(d)?.map(|id| match id {
+        Id::S(s) => s,
+        Id::N(n) => n.to_string(),
+    }))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Good,

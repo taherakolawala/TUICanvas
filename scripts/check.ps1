@@ -38,6 +38,7 @@ foreach ($task in ($Tasks -split ' ')) {
         'bench'   { Step 'bench' { & $exe --bench 10 } }
         'sysinfo' { Step 'sysinfo' { (Get-CimInstance Win32_Processor).Name; (Get-CimInstance Win32_OperatingSystem).Caption; '{0} GB RAM' -f [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB) } }
         'survey'  { Step 'survey' { & $python -m tools.survey_assignments } }
+        'files-probe' { Step 'files-probe' { & $python -m tools.probe_files } }
         'bench-browser' { Step 'bench-browser' { & $python -m tools.browser_bench --runs 10 } }
         # Draws to a real console window (opens one briefly) to include terminal output cost.
         'bench-terminal' { Step 'bench-terminal' { Start-Process -FilePath $exe -ArgumentList '--bench', '5', '--terminal' -WorkingDirectory $root -Wait; Get-Content (Join-Path $root 'benchmarks\private\tui-bench-terminal.json') -TotalCount 12 } }

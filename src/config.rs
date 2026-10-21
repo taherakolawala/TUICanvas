@@ -42,6 +42,16 @@ impl Config {
         self.data_dir.join("cache").join("v1").join(&self.host)
     }
 
+    /// The user's file library: `TUICANVAS_LIBRARY`, else `<home>\TUICanvas`.
+    pub fn library_root(&self) -> PathBuf {
+        if let Ok(dir) = std::env::var("TUICANVAS_LIBRARY") {
+            return PathBuf::from(dir);
+        }
+        let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join("TUICanvas")
+    }
+
     pub fn private_reports(&self) -> PathBuf {
         self.project_dir.join("benchmarks").join("private")
     }

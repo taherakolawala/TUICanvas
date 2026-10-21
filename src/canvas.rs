@@ -124,6 +124,16 @@ impl CanvasClient {
         }
     }
 
+    /// The Cookie header Canvas expects for `path` on the origin (used to start downloads).
+    pub fn cookie_header(&self, path: &str) -> Option<String> {
+        let jar = self.jar.lock().unwrap_or_else(|e| e.into_inner());
+        jar.header_for(&self.host, path, session::now_seconds())
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
     fn check_path(path: &str) -> Result<(), CanvasError> {
         let ok = (path.starts_with("/api/v1/") || path == "/api/graphql")
             && !path.contains('\\')
