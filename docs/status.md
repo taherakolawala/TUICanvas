@@ -1,6 +1,6 @@
 # Project status
 
-Last updated: 2026-10-20. Update this file whenever a milestone moves.
+Last updated: 2026-10-21. Update this file whenever a milestone moves.
 
 ## Where things stand
 
@@ -14,6 +14,10 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 | 4. Selective resource reuse | Partly | Saved copies for courses, assignment lists and details only (always re-read on entry) |
 | 5. Prediction experiment | Not started | |
 | 6. Hardening and delivery | Not started | |
+| 7. Local file library | **In progress** | Design approved 2026-10-21 (see [build plan](build-plan.md#version-2-files-and-submissions)) |
+| 8. Class Files and assignment attachments | Next | |
+| 9. Sign-in for the Canvas Lite test site | Waiting on the test accounts | |
+| 10. Submissions (file upload, text entry) | After 9 | Tested only on the Canvas Lite course |
 
 ## What works today
 
@@ -50,7 +54,14 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 
 ## What's next
 
-The baseline shows that almost all remaining time is Canvas's network response (≈260–410 ms per read), so the next wins come from overlapping or avoiding reads rather than from faster local code.
+**Now: version 2, files and submissions** (milestones 7–10 above). A survey of all 161 assignments in your 17 courses shaped the plan:
+
+- **How work is handed in:** file upload 63, Canvas quizzes 52, external tools 34, text entry 18.
+- **What assignments link to:** 63 distinct Canvas files (32 PDFs, 9 images, 6 Word files), 18 Canvas pages, 28 modules and 49 outside sites.
+
+Quizzes and assessments are permanently out of scope.
+
+After version 2, the remaining version 1 milestones follow. The baseline shows that almost all remaining time is Canvas's network response (≈260–410 ms per read), so the next wins come from overlapping or avoiding reads rather than from faster local code.
 
 1. **Milestone 4.** Decide per resource whether anything beyond the three saved copies is worth reusing. For example, the course list (21 KB, rarely changes) could be shown from its saved copy and refreshed less often. Each change needs your approval under the freshness rules.
 2. **Milestone 5.** Prefetch an assignment's detail after its row stays selected for about 150 ms, under the approved 2-second freshness rule. That could hide most of the ≈270 ms detail read. Measure hits and wasted requests with prediction on and off, using `--bench` and `--diag`.

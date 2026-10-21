@@ -8,7 +8,9 @@ Build a Windows-first, keyboard-driven Canvas reader for the user's UF account, 
 
 First complete slice: terminal sign in with username/password and Duo → course list → GPU Computing assignment list → assignment details, deadline, and current submission status. Expose refresh, back, filtering of the loaded list, error/retry state, and open-in-browser for the assignment. Course-wide full-text search, global calendar, inbox, discussions, module navigation, native assignment submissions, quiz taking, file opening/downloading/preview, and broad institution support are later work. No assignment writes or speculative mutations in the first version. Authentication form submissions are required for login.
 
-File handling is explicitly deferred to v2, including PDF, DOC/DOCX, TXT, and other attachments. Preserve attachment references in description text, but do not implement a file viewer, downloader, or system-viewer launch in v1. The user has a design idea for that later version.
+File handling was deferred to v2, including PDF, DOC/DOCX, TXT, and other attachments; v1 preserves attachment references in description text only. The v2 design, approved on 2026-10-21, is in "Version 2: files and submissions" below.
+
+**Permanently out of scope:** quizzes and other assessments (Classic and New Quizzes, proctored exams such as Honorlock), viewing or taking them included. Supporting them would expose the project to academic-integrity and policy risk. The reader opens them in the browser at most.
 
 ## Evidence and missing evidence
 
@@ -106,6 +108,53 @@ Compare 5–10 initial runs of equivalent browser/TUI workflows with identical a
 ## Approval and remaining consultation
 
 The user approved building with Rust, the narrowed reader scope, authentication experiment, milestone order, and the prediction rules, amended to permit cached initial assignment display with Syncing. Cold login should be entirely in the terminal if feasible, with browser fallback accepted. Later login should reuse valid session state. File handling and module navigation are excluded from v1. Broader features and any permanent browser-bridge tradeoff remain consultation points.
+
+## Version 2: files and submissions
+
+Approved by the user on 2026-10-21. It builds on the v1 reader and keeps every v1 rule (freshness, saved copies, read-only by default). The only writes it adds are submissions the user explicitly confirms.
+
+### Local library
+
+All files live under one folder, `C:\Users\taher\TUICanvas` by default (configurable):
+
+```
+TUICanvas\
+  <course code> <course name>\
+    Class Files\        mirrors the course's Canvas Files tree; only files the user chooses to download exist
+    Assignment Files\
+      <assignment name>\  attachments the user chose to download, and the assignment's images
+```
+
+- **Class Files.** The reader lists the course's whole folder tree from Canvas in one read, so browsing it needs no further requests. Downloading is always the user's choice, per file or per folder. Courses that hide Files from students say so; their assignment attachments still work.
+- **Assignment Files.** Files linked from an assignment's description are listed there and downloaded when the user chooses.
+- **Images** in an assignment are downloaded automatically when it is opened, so they open instantly later. They are deleted after 30 days without use.
+- **One copy.** A Canvas file referenced from both places is stored once, using NTFS hard links: the same data appears in both folders. If linking is impossible (for example across drives), a second copy is made and both are tracked.
+- **Resync.** Any downloaded file or folder can be resynced manually. A small index (Canvas file id → Canvas version, size, local paths, last use) lets the reader mark files that changed on Canvas since download and apply the 30-day image rule.
+- **Opening** a file uses its default Windows app for now; the user is still considering in-terminal previews.
+- **Download safety.** Canvas redirects downloads to a separate signed storage host. Cookies and the CSRF token go only to the Canvas origin, never to the storage host. Downloads are streamed to a temporary file and moved into place only when complete.
+
+### Submitting
+
+- **Types:** file upload, accepting any file type the assignment allows, and text entry, either typed in the reader or taken from a file path.
+- **Choosing files:** the user types one or more paths. Each is checked to exist and to match the assignment's allowed extensions before anything is sent.
+- **Confirmation:** a review screen shows the assignment, the due date and whether the submission would be late, the attempt number against the allowed attempts, and each file with its size. Nothing is sent until the user confirms explicitly. There are no automatic or speculative submissions.
+- **Verification:** after submitting, the reader re-reads the submission from Canvas and shows what Canvas recorded (time, attempt, files).
+- **Excluded:** quizzes, assessments and external-tool assignments open in the browser.
+
+### Other Canvas content
+
+Links to Canvas content the reader does not handle yet (modules, discussions, pages, quizzes, external tools) open in the browser. Linked assignments open in the reader.
+
+### Testing
+
+Submissions are tested against a separate Canvas Lite course with a teacher account and a student account the user created, never against real courses. Read-only file features are developed against the user's real courses. Unit tests use the scripted transport as before.
+
+### Milestones
+
+7. Local library: folders, index, hard links, safe downloads, eviction, resync.
+8. Class Files browser and assignment attachments (read-only against real courses).
+9. Sign-in for a non-UF Canvas origin (visible-browser mode) to reach the test course.
+10. Submissions (file upload and text entry) against the test course, then first real use by the user.
 
 ## Technical references
 
