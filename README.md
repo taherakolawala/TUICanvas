@@ -15,11 +15,11 @@ Mon Oct 5 11:59 PM   Lab-1 Assignment                 Graded 9/10        10 pts
 
 Current progress, known issues and next steps: [docs/status.md](docs/status.md). How it works and which optimizations are in place: [docs/architecture.md](docs/architecture.md). Measured against the Canvas website: [benchmarks/baseline-2026-10-20.md](benchmarks/baseline-2026-10-20.md).
 
-Version 1 is in progress. It covers sign in (GatorLink + Duo) → course list → assignment list → assignment details (deadline, submission status, description).
+It covers sign in (GatorLink + Duo) → course list → assignment list → assignment details (deadline, submission status, description), and course files.
 
 - Every screen shows a saved copy right away, with **Syncing…** at the top while it fetches fresh data. If the fetch fails, the screen says **Outdated** instead of pretending the old copy is current.
-- Keys: refresh, back, filter, and open-in-browser.
-- Files, modules, discussions, the inbox and submitting work are out of scope for v1 (see `docs/build-plan.md`).
+- **Files.** Each course has a Files tab that mirrors its Canvas folders, and each assignment lists its attachments and links. Files download into `C:\Users\<you>\TUICanvas\<course>\Class Files` or `Assignment Files\<assignment>` and open in their default app. A file used in both places is stored once.
+- Submitting work (file upload, text entry) is next; modules, pages and discussions open in the browser for now. Quizzes and assessments are out of scope (see `docs/build-plan.md`).
 
 ## How sign-in works
 
@@ -61,11 +61,14 @@ tuicanvas --bench [N]     Time the workflow N times -> benchmarks/private/tui-be
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `j` `k`, PgUp/PgDn, `g` `G` | Move or scroll |
-| `Enter` / `→` | Open |
-| `Esc` / `←` / Backspace | Back (or clear the filter) |
-| `/` | Filter the current list |
+| `Enter` / `→` | Open (a file opens in its default app, downloading it first if needed) |
+| `Esc` / `←` / Backspace | Back (or clear the filter or selection) |
+| `Tab` | In a course: switch between Assignments and Files. In an assignment: select the next file or link (`1`–`9` jump to one) |
+| `d` / `D` | Download the selected file (or folder) / everything here |
+| `e` | Show the file or its folder in File Explorer (on the course list: your TUICanvas folder) |
+| `/` | Filter the current list (in Files: search the whole course) |
 | `r` | Refresh now |
-| `o` | Open the current item in your browser |
+| `o` | Open the current item, or the selected link, in your browser |
 | `L` | Sign in again |
 | `q` | Quit |
 
@@ -84,3 +87,4 @@ tuicanvas --bench [N]     Time the workflow N times -> benchmarks/private/tui-be
 - Raw HAR captures, session files and private reports are ignored by git.
 - Diagnostics record only endpoint templates, statuses, sizes and timings. They never record URLs with IDs, cookies or response bodies.
 - Saved copies of course data live under `%LOCALAPPDATA%\TUICanvas\cache`, separated by Canvas origin and account.
+- Downloaded files live in `%USERPROFILE%\TUICanvas` (set `TUICANVAS_LIBRARY` to move it). Canvas cookies are sent only to Canvas, never to its file storage hosts.

@@ -4,7 +4,7 @@ Last updated: 2026-10-21. Update this file whenever a milestone moves.
 
 ## Where things stand
 
-How the pieces fit together is described in [architecture.md](architecture.md). Milestones 1–3 of [the build plan](build-plan.md) are done. Milestone 4 is partly done through the saved copies that came with Milestone 2; Milestones 5 and 6 have not started.
+How the pieces fit together is described in [architecture.md](architecture.md). Milestones 1–3 of [the build plan](build-plan.md) are done, and so are Milestones 7 and 8 of version 2 (the file library, Class Files and assignment attachments). Milestone 4 is partly done through the saved copies that came with Milestone 2; Milestones 5 and 6 have not started.
 
 | Milestone | State | What exists |
 | --- | --- | --- |
@@ -14,8 +14,8 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 | 4. Selective resource reuse | Partly | Saved copies for courses, assignment lists and details only (always re-read on entry) |
 | 5. Prediction experiment | Not started | |
 | 6. Hardening and delivery | Not started | |
-| 7. Local file library | **In progress** | Design approved 2026-10-21 (see [build plan](build-plan.md#version-2-files-and-submissions)) |
-| 8. Class Files and assignment attachments | Next | |
+| 7. Local file library | **Done** | `%USERPROFILE%\TUICanvas\<course>\Class Files` and `Assignment Files`; one stored copy per file shown in several places through hard links; change detection; safe names; 30-day clean-up of automatic images; downloads restricted to Canvas and its storage hosts. Verified live: download, install, hard link, internet mark. |
+| 8. Class Files and assignment attachments | **Done** | Files tab per course (folders, search across the course, download one, a folder or all, show in Explorer); files & links list on each assignment, numbered like the text; images downloaded with the assignment; other assignments open in the reader, everything else in the browser |
 | 9. Sign-in for the Canvas Lite test site | Waiting on the test accounts | |
 | 10. Submissions (file upload, text entry) | After 9 | Tested only on the Canvas Lite course |
 
@@ -27,6 +27,9 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - The app starts sign-in itself if the saved session has expired at launch. Mid-session expiry shows a banner and waits for `L`.
 - **Reader** (`target\release\tuicanvas.exe`).
   - Shows course list, assignment list (due date, status, points) and assignment detail (deadline, availability, status, attempts, description with links).
+  - **Files.** Each course has Assignments and Files tabs (`Tab`). Files mirrors the course's Canvas folders; `Enter` opens a file in its default app (downloading it first if needed), `d` downloads, `D` downloads a whole folder, `e` shows it in File Explorer, `/` searches every folder. Each file shows whether it is saved, newer on Canvas, downloading or locked.
+  - **Assignment files & links.** A numbered list under each description, matching the `[n]` marks in the text. `Tab` or `1`–`9` selects, `Enter` opens (files in their app, other assignments in the reader, anything else in the browser), `d`/`D` download, `e` shows the folder, `o` opens the selected item's page in the browser.
+  - Files go to `C:\Users\<you>\TUICanvas` (`e` on the course list opens it). Images in an assignment download when you open it and are removed after 30 days unused.
   - Each screen shows its saved copy at once, with **Syncing** at the top, and is labelled **Outdated** if the fresh read fails.
   - Colours mark deadline urgency and status.
 - **Reads**, measured live on one account, 17 courses, 157 assignments:
@@ -39,7 +42,8 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - Saved copies appear in about 1 ms.
   - The reader's own work (parse, update, draw) takes 1–3 ms; the rest is Canvas's response time.
   - All three build-plan performance goals are met.
-- **Checks.** 44 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads; `tuicanvas --dump DIR` renders each screen headlessly.
+- **Downloads**, measured live: a 908 KB PDF in 1.1 s through the full redirect chain, saved, linked and marked as downloaded from the internet.
+- **Checks.** 62 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads, file access and one download; `tuicanvas --dump DIR` renders each screen headlessly, including the Files tab, and downloads one file into a scratch library.
 
 ## Known issues and limits
 
@@ -50,11 +54,13 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 - **Back re-reads the list.** Returning to a list from a detail re-reads it, per the approved "fresh on every entry" rule. This costs one request per Back.
 - **Git Bash** may print sign-in progress as separate lines instead of one updating line. PowerShell and Windows Terminal show the spinner properly.
 - **The baseline is narrow:** one machine, one evening, 10 runs, with the browser headless. Good for medians, not for tail latency.
-- **Out of scope for v1:** files and attachments (links are shown, not opened), modules, discussions, inbox, calendar, submitting.
+- **Images open in an outside app.** Showing images inside the terminal is not done yet (Windows Terminal can display them; a possible later step).
+- **Locked and hidden files.** Files Canvas marks as locked are not downloaded (one past lab here). In 8 of 17 courses the instructor hides Files, so the Files tab is empty there; attachments linked from assignments still work. Two linked files return 403 and can only be opened in the browser.
+- **Out of scope for now:** modules, pages, discussions, inbox and calendar (links to them open in the browser); submitting comes in Milestone 10. Quizzes and assessments are permanently out of scope.
 
 ## What's next
 
-**Now: version 2, files and submissions** (milestones 7–10 above). A survey of all 161 assignments in your 17 courses shaped the plan:
+**Now: version 2, submissions** (milestones 9–10 above). Milestone 9 waits for the Canvas Lite test accounts. A survey of all 161 assignments in your 17 courses shaped the plan:
 
 - **How work is handed in:** file upload 63, Canvas quizzes 52, external tools 34, text entry 18.
 - **What assignments link to:** 63 distinct Canvas files (32 PDFs, 9 images, 6 Word files), 18 Canvas pages, 28 modules and 49 outside sites.

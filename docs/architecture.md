@@ -4,7 +4,7 @@ How TUICanvas works today: the pieces, how a screen gets its data, how sign-in w
 
 TUICanvas has two programs:
 
-- **`tuicanvas.exe` (Rust).** The reader you use. It draws the terminal UI and makes read-only Canvas API calls directly over HTTPS. It never loads the Canvas web app.
+- **`tuicanvas.exe` (Rust).** The reader you use. It draws the terminal UI and makes read-only Canvas API calls directly over HTTPS. It never loads the Canvas web app. It also downloads course files into a folder on your PC (the file library) and opens them in their default apps.
 - **The sign-in helper (Python, `tools/terminal_login.py`).** It runs only when a session is missing or expired. It drives UF's normal GatorLink + Duo login in a hidden Microsoft Edge window from the terminal, checks the result, and saves the session for the reader.
 
 The two share one file: the session, encrypted with Windows DPAPI at `%LOCALAPPDATA%\TUICanvas\ufl.session.dpapi`.
@@ -22,7 +22,11 @@ flowchart LR
         client["Canvas client<br/>api.rs + canvas.rs"]
         store[("Saved copies<br/>cache.rs")]
         diag["Diagnostics<br/>diag.rs"]
+        dl["Downloader<br/>download.rs, up to 2 at once"]
     end
+    lib[("File library<br/>%USERPROFILE%\TUICanvas")]
+    winapps["Default Windows apps,<br/>File Explorer"]
+    storage["Canvas file storage<br/>canvas-user-content.com,<br/>inscloudgate.net"]
     subgraph helper["Sign-in helper (Python)"]
         login["terminal_login.py"]
         edge["Headless Edge<br/>via Playwright"]
@@ -41,6 +45,13 @@ flowchart LR
     client -- "timings, sizes, status" --> diag
     session -- "Canvas cookies" --> client
     client -- "rotated cookies" --> session
+    state -- "download effects" --> dl
+    dl -- "cookies on the first hop only" --> canvas
+    canvas -- "redirect to a signed address" --> storage
+    storage -- "file contents" --> dl
+    dl -- "install, link" --> lib
+    state -- "open file, show folder" --> winapps
+    winapps --> lib
     state -- "sign-in needed" --> login
     login --> edge --> idp
     edge --> canvas
@@ -56,12 +67,14 @@ flowchart LR
 | Session | `src/session.rs`, `src/protect.rs` | Decrypt and encrypt the shared session with DPAPI, preserving every field the helper wrote. A small cookie jar matches domain, path and expiry, and absorbs `Set-Cookie` rotations. It also extracts the CSRF token. |
 | Transport | `src/transport.rs` | One pooled `reqwest` client: HTTPS only, no redirects, timeouts, gzip, HTTP/2 when the server offers it, 16 MB response cap. Behind a trait so tests use a scripted fake. |
 | Canvas client | `src/canvas.rs` | Allowlisted paths, cookies and CSRF, error classification, throttling back-off, pagination, GraphQL error handling |
-| Reads | `src/api.rs` | The reviewed read operations: courses (REST), assignment list (GraphQL with REST fallback), assignment detail (REST), profile |
-| Model | `src/model.rs` | Typed courses, assignments and submissions; the status shown for each assignment (Missing, Submitted late, Graded 9/10, …) |
+| Reads | `src/api.rs` | The reviewed read operations: courses (REST), assignment list (GraphQL with REST fallback), assignment detail (REST), a course's folders and files (REST), one file's details (REST), profile |
+| Model | `src/model.rs` | Typed courses, assignments, submissions, files and folders; the status shown for each assignment (Missing, Submitted late, Graded 9/10, …) |
+| File library | `src/library.rs` | The folder tree under `%USERPROFILE%\TUICanvas`, Windows-safe names, one stored copy per Canvas file shown in several places through hard links, an index of versions and last use, and the 30-day clean-up of automatic image downloads |
+| Downloads | `src/download.rs` | Follows Canvas's redirects by hand: cookies only to the Canvas origin, then only to Canvas's two storage domains over HTTPS. Streams to a partial file, checks the length, 2 GB cap. |
 | Saved copies | `src/cache.rs` | Versioned JSON snapshots per Canvas origin and account, written atomically |
-| App state | `src/app.rs` | Pure state machine. Messages in (keys, fetch results, ticks); effects out (fetch, open URL, sign in). Owns navigation, filtering and freshness rules. |
-| Runtime | `src/tui.rs` | Terminal setup and restore, input thread, async executor, sign-in handoff, headless `--dump` mode |
-| Rendering | `src/ui.rs`, `src/theme.rs`, `src/html.rs` | Screens, colours, description HTML to terminal text |
+| App state | `src/app.rs` | Pure state machine. Messages in (keys, fetch results, download progress, ticks); effects out (fetch, download, open a file, show a folder, open URL, sign in). Owns navigation, filtering, freshness rules and where each file goes. |
+| Runtime | `src/tui.rs` | Terminal setup and restore, input thread, async executor and download slots, sign-in handoff, opening files and folders, headless `--dump` mode |
+| Rendering | `src/ui.rs`, `src/theme.rs`, `src/html.rs` | Screens, the Assignments/Files tabs, the files & links list, colours, description HTML to terminal text with links numbered to match the list |
 | Diagnostics | `src/diag.rs` | Endpoint templates, status, bytes and timings; optional JSONL log. Never URLs with ids, headers or bodies. |
 | Live check | `src/smoke.rs` | Read-only verification against Canvas that writes a metadata-only report |
 | Sign-in helper | `tools/terminal_login.py`, `tools/auth_ui.py`, `tools/auth_session.py` | Browser-driven login, the one-line status display, DPAPI save, native verification |
@@ -200,6 +213,61 @@ Details that matter:
 - **Completion is checked natively.** The helper confirms sign-in with a direct API read, not by looking for something on the Canvas page, because Canvas changes its pages.
 - **What gets saved.** The whole Playwright storage state, so UF and Duo cookies survive for the next browser login. The reader only ever sends cookies that belong to Canvas.
 
+## Files and the local library
+
+Course files live in an ordinary folder you can browse in File Explorer:
+
+```text
+C:\Users\<you>\TUICanvas\
+├── EEL5934 Introduction to GPU Computing\
+│   ├── Class Files\              the course's Files area, same folders as Canvas
+│   │   └── Slides\mod-1-intro-accessible.pdf
+│   └── Assignment Files\
+│       └── Lab-2 Assignment\     attachments and images of that assignment
+└── .tuicanvas\                   index (versions, paths, last use) and partial downloads
+```
+
+- **Where you find files.** Each course has two tabs, **Assignments** and **Files** (`Tab` switches). Files shows the course's folders as Canvas has them; one listing read covers the whole course, so moving between folders and searching (`/`, across all folders) needs no further reads. Each assignment has a **Files & links** list under its description, numbered like the links in the text.
+- **When files download.**
+  - When you open one (`Enter`, then it opens in its default app), or ask for it (`d`, or `D` for everything in a folder or assignment).
+  - Images in an assignment's description download automatically when the assignment is read, so they open instantly later. They are removed after 30 days without use, unless you opened or downloaded them yourself.
+- **One copy, several places.** A file that is both in Class Files and attached to an assignment is stored once and appears in both folders through an NTFS hard link (a second name for the same data). If linking is impossible, it is copied, and both copies are tracked.
+- **Keeping files current.** The index records each file's Canvas version (modified time and size). When Canvas has a newer version, the file shows **newer on Canvas**; downloading it again overwrites the stored copy in place, which updates every place it appears.
+- **Names.** Windows-safe (reserved characters and names replaced, length capped, extension kept). Two different files that want the same name in one folder get `name (file id).ext`; a file the reader did not put there is never replaced.
+- **Locked and hidden files.** A file Canvas marks as locked is not downloaded; its reason is shown. When an instructor hides a course's Files area (8 of 17 courses here), the Files tab says so, and files linked from assignments still work.
+
+Opening a file linked from an assignment:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant App as App state
+    participant Lib as File library
+    participant Ex as Executor
+    participant API as Canvas
+    participant S as Canvas storage
+    Note over App,API: When the assignment was read, its linked files' details were read too
+    You->>App: Tab to the file, Enter
+    App->>Lib: saved and current? (version, existing paths)
+    alt saved and current
+        Lib-->>App: yes, linked into this assignment's folder
+        App-->>You: open in the default app
+    else not saved, or newer on Canvas
+        App->>Ex: Download(file, target)
+        Ex->>API: GET file address with Canvas cookies
+        API-->>Ex: 302 to canvas-user-content.com
+        Ex->>S: follow redirects without cookies (signed address)
+        S-->>Ex: file contents, streamed to .tuicanvas\partial
+        Ex->>Lib: mark as downloaded from the internet, install (move or overwrite in place)
+        Ex->>App: Done, with progress along the way
+        App-->>You: open in the default app
+    end
+```
+
+- **Opening.** Files open in their default Windows app. Programs and scripts (`.exe`, `.bat`, `.ps1`, `.lnk` and similar) are never opened: they are shown selected in File Explorer instead. Downloaded files carry the same "downloaded from the internet" mark that browsers add, so Office opens them in Protected View and Windows checks programs with SmartScreen.
+- **Links.** Other assignments open in the reader. Canvas pages, modules, discussions and tools open in the browser (out of scope for the reader for now), as do outside sites and email links.
+
 ## Rendering
 
 - **Event-driven.** The screen redraws only when state changed (a key, a result, a resize). With nothing loading, the main loop blocks on its message channel and uses no CPU. While the current screen syncs, a 150 ms tick animates the badge.
@@ -229,6 +297,12 @@ Details that matter:
 | Local filtering | `app.rs` | `/` filters loaded rows without any request |
 | Session reuse and cookie rotation | `session.rs`, `tui.rs` | No browser and no Duo while the session is valid; rotated cookies are saved back |
 | Native sign-in check | `terminal_login.py` | Sign-in finishes as soon as Canvas accepts the session, without waiting on page elements |
+| One listing per course's Files | `api.rs`, `app.rs` | The folders and files reads run together (about 300 ms for 2 requests here); moving between folders and searching need no request |
+| No download while the saved copy is current | `app.rs`, `library.rs` | A saved, current file opens straight from disk; the comparison uses the index, not a request |
+| One stored copy per file | `library.rs` | Hard links: a file in several places takes its space once, and one re-download updates all of them |
+| Separate download slots | `tui.rs` | At most 2 downloads at once, apart from the 4 read slots, so a large download never delays a screen |
+| Streamed downloads | `download.rs`, `tui.rs` | Written to disk as they arrive; progress reported at most every 120 ms. Measured: a 908 KB PDF in 1.1 s, including the redirects. |
+| Images fetched with the assignment | `app.rs` | Opening an image later needs no wait |
 | Release build tuning | `Cargo.toml` | Thin LTO; debug info stripped |
 
 Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke` runs on one account and home connection (see [request-policy.md](request-policy.md)).
@@ -242,10 +316,10 @@ Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke`
 
 ## Safety properties
 
-- **Read only.** The only POST is the reviewed GraphQL list query; nothing writes to Canvas.
+- **Read only.** The only POST is the reviewed GraphQL list query; nothing writes to Canvas. Downloads are reads.
 - **Allowlisted paths.** Requests go only to `/api/v1/` and `/api/graphql` on the configured origin. Pagination links must stay on that origin and path. IDs are validated before they go into a URL.
-- **Cookies stay scoped.** Identity-provider cookies are never sent to Canvas, and the CSRF token is sent only on POST.
-- **Browser opens stay on Canvas.** `o` opens only URLs on the configured Canvas origin.
+- **Cookies stay scoped.** Identity-provider cookies are never sent to Canvas, and the CSRF token is sent only on POST. Downloads send Canvas cookies only to the Canvas origin; the redirects after that go only to Canvas's two storage domains, over HTTPS, without cookies.
+- **What opens outside the reader.** Pages for courses, assignments and files are built on the configured Canvas origin. Links in descriptions open like a click in the browser would, limited to `https`, `http` and `mailto`. Downloaded programs and scripts are never run.
 - **Per-account copies.** Saved copies are separated by Canvas origin and account; `--logout` deletes the session and that account's copies.
 - **No content in diagnostics.** Diagnostics, smoke reports and the helper's report contain statuses, sizes and timings only. Raw captures and reports stay in git-ignored folders.
 
@@ -254,8 +328,8 @@ Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke`
 | Tool | Use |
 | --- | --- |
 | `cargo test`, `python -m unittest tools.test_*` | Unit tests with a scripted transport, synthetic sessions and replayed Duo screens; no network, credentials or MFA |
-| `tuicanvas --smoke` | Live read-only verification and measurement → `benchmarks/private/smoke.json` |
-| `tuicanvas --dump DIR` | Walks courses → course → assignment headlessly and writes each rendered screen as text, with render and sync timings |
+| `tuicanvas --smoke` | Live read-only verification and measurement → `benchmarks/private/smoke.json`. Includes a course's Files listing, access to every file linked from its assignments, and one download into a scratch library with a hard-link check. |
+| `tuicanvas --dump DIR` | Walks courses → course → assignment → Files tab → a folder headlessly, downloads the smallest file there into a scratch library through the same path the reader uses, and writes each rendered screen as text, with render and sync timings |
 | `tuicanvas --diag` | Logs every request (template, status, size, timing) and every frame to `%LOCALAPPDATA%\TUICanvas\diagnostics.jsonl`. Frames: startup to first frame, each key to its frame, and each read from the action that caused it to the frame showing its data, split into network, parse and response-to-frame. Also logs CPU and peak memory at exit. |
 | `tuicanvas --bench N` | Runs start → course list → course → assignment → back N times, cold and warm, on an in-memory screen (or `--terminal` for a real console). Uses a private snapshot folder. Writes `benchmarks/private/tui-bench*.json`. |
 | `tools/browser_bench.py` | The same workflow on the Canvas website in headless Edge with the saved session. Content-visible time is taken from the page's own clock; requests and transferred bytes are counted with DevTools Protocol events. Writes `benchmarks/private/browser-bench.json`. |

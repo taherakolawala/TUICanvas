@@ -130,7 +130,7 @@ TUICanvas\
 - **Images** in an assignment are downloaded automatically when it is opened, so they open instantly later. They are deleted after 30 days without use.
 - **One copy.** A Canvas file referenced from both places is stored once, using NTFS hard links: the same data appears in both folders. If linking is impossible (for example across drives), a second copy is made and both are tracked.
 - **Resync.** Any downloaded file or folder can be resynced manually. A small index (Canvas file id → Canvas version, size, local paths, last use) lets the reader mark files that changed on Canvas since download and apply the 30-day image rule.
-- **Opening** a file uses its default Windows app for now; the user is still considering in-terminal previews.
+- **Opening** a file uses its default Windows app for now; the user is still considering in-terminal previews. Programs and scripts are never opened (they are shown in File Explorer), and downloads carry the browser's "downloaded from the internet" mark so Office and SmartScreen treat them as such.
 - **Download safety.** Canvas redirects downloads to a separate signed storage host. Cookies and the CSRF token go only to the Canvas origin, never to the storage host. Downloads are streamed to a temporary file and moved into place only when complete.
 
 ### Submitting
@@ -151,8 +151,8 @@ Submissions are tested against a separate Canvas Lite course with a teacher acco
 
 ### Milestones
 
-7. Local library: folders, index, hard links, safe downloads, eviction, resync.
-8. Class Files browser and assignment attachments (read-only against real courses).
+7. Local library: folders, index, hard links, safe downloads, eviction, resync. **Done 2026-10-21.**
+8. Class Files browser and assignment attachments (read-only against real courses). **Done 2026-10-21.**
 9. Sign-in for a non-UF Canvas origin (visible-browser mode) to reach the test course.
 10. Submissions (file upload and text entry) against the test course, then first real use by the user.
 
