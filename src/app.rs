@@ -281,6 +281,7 @@ pub struct App {
     pub announcements: HashMap<String, Resource<Vec<crate::announcements::Summary>>>,
     pub announcement_details: HashMap<(String, String), Resource<crate::announcements::Detail>>,
     pub announcement_render: Option<DetailRender>,
+    announcement_reads: std::collections::BTreeSet<(String, String)>,
     pub assignments: HashMap<String, Resource<Vec<AssignmentSummary>>>,
     pub details: HashMap<(String, String), Resource<AssignmentDetail>>,
     pub stack: Vec<View>,
@@ -342,6 +343,10 @@ fn percent_encode(segment: &str) -> String {
 
 impl App {
     pub fn new(origin: &str, store: Option<Arc<SnapshotStore>>) -> Self {
+        let announcement_reads = store
+            .as_ref()
+            .map(|s| s.announcement_reads())
+            .unwrap_or_default();
         App {
             origin: origin.to_string(),
             store,
@@ -349,6 +354,7 @@ impl App {
             announcements: HashMap::new(),
             announcement_details: HashMap::new(),
             announcement_render: None,
+            announcement_reads,
             assignments: HashMap::new(),
             details: HashMap::new(),
             stack: vec![View::new(ViewKind::Courses)],
@@ -436,6 +442,7 @@ impl App {
     fn enter_current(&mut self, explicit: bool) -> Vec<Effect> {
         let key = self.view().key();
         self.load_snapshot(&key);
+        self.mark_current_announcement_read();
         self.dirty = true;
         self.request(key, explicit).into_iter().collect()
     }
@@ -681,6 +688,7 @@ impl App {
                     ),
                 }
                 self.clamp_selection();
+                self.mark_current_announcement_read();
                 effects
             }
             Err(error) => {
@@ -1764,6 +1772,43 @@ impl App {
         }
     }
 
+    pub fn announcement_status(
+        &self,
+        course_id: &str,
+        summary: &crate::announcements::Summary,
+    ) -> &'static str {
+        if self
+            .announcement_reads
+            .contains(&(course_id.into(), summary.id.clone()))
+        {
+            "Read"
+        } else {
+            summary.status()
+        }
+    }
+
+    fn mark_current_announcement_read(&mut self) {
+        let ViewKind::Announcement {
+            course_id,
+            announcement_id,
+            ..
+        } = &self.view().kind
+        else {
+            return;
+        };
+        let key = (course_id.clone(), announcement_id.clone());
+        let readable = self
+            .announcement_details
+            .get(&key)
+            .and_then(|r| r.data.as_ref())
+            .is_some_and(|d| d.can_view() && d.message.is_some());
+        if readable && self.announcement_reads.insert(key) {
+            if let Some(store) = &self.store {
+                store.save_announcement_reads(&self.announcement_reads);
+            }
+        }
+    }
+
     pub fn announcement_links(&self, course_id: &str, id: &str) -> Vec<Link> {
         let Some(detail) = self
             .announcement_details
@@ -2475,6 +2520,118 @@ mod tests {
             fetch_of(&effects).0,
             ResourceKey::Announcements("10".into())
         );
+    }
+
+    #[test]
+    fn local_announcement_reads_survive_refresh_restart_and_stay_account_scoped() {
+        let root =
+            std::env::temp_dir().join(format!("tuicanvas-local-reads-{}", std::process::id()));
+        let store = Arc::new(SnapshotStore::new(&root, "reader"));
+        let mut app = app_with_courses();
+        app.store = Some(store.clone());
+        app.update(key(KeyCode::Enter));
+        let (k, r) = fetch_of(&app.update(key(KeyCode::BackTab)));
+        let summary = crate::announcements::Summary {
+            id: "8".into(),
+            read_state: Some("unread".into()),
+            ..Default::default()
+        };
+        deliver(
+            &mut app,
+            k,
+            r,
+            Payload::Announcements(vec![summary.clone()]),
+        );
+        assert_eq!(app.announcement_status("10", &summary), "Unread");
+        let (k, r) = fetch_of(&app.update(key(KeyCode::Enter)));
+        assert_eq!(app.announcement_status("10", &summary), "Unread");
+        let detail = crate::announcements::Detail {
+            base: summary.clone(),
+            message: Some("Read me".into()),
+            locked_for_user: Some(true),
+            ..Default::default()
+        };
+        deliver(&mut app, k, r, Payload::Announcement(Box::new(detail)));
+        assert_eq!(app.announcement_status("10", &summary), "Read");
+        let (k, r) = fetch_of(&app.update(key(KeyCode::Esc)));
+        deliver(
+            &mut app,
+            k,
+            r,
+            Payload::Announcements(vec![summary.clone()]),
+        );
+        assert_eq!(app.announcement_status("10", &summary), "Read");
+        assert_eq!(
+            app.announcements["10"].data.as_ref().unwrap()[0]
+                .read_state
+                .as_deref(),
+            Some("unread")
+        );
+        let restarted = App::new(&app.origin, Some(store));
+        assert_eq!(restarted.announcement_status("10", &summary), "Read");
+        assert_eq!(restarted.announcement_status("20", &summary), "Unread");
+        let other = App::new(
+            &app.origin,
+            Some(Arc::new(SnapshotStore::new(&root, "other"))),
+        );
+        assert_eq!(other.announcement_status("10", &summary), "Unread");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unavailable_and_unseen_announcement_details_are_not_marked_read() {
+        for (leave, restricted, fail) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut app = app_with_courses();
+            app.update(key(KeyCode::Enter));
+            let (k, r) = fetch_of(&app.update(key(KeyCode::BackTab)));
+            let summary = crate::announcements::Summary {
+                id: "8".into(),
+                read_state: Some("unread".into()),
+                ..Default::default()
+            };
+            deliver(
+                &mut app,
+                k,
+                r,
+                Payload::Announcements(vec![summary.clone()]),
+            );
+            let (k, r) = fetch_of(&app.update(key(KeyCode::Enter)));
+            if leave {
+                app.update(key(KeyCode::Esc));
+            }
+            let detail = crate::announcements::Detail {
+                base: summary.clone(),
+                message: Some("Message".into()),
+                lock_info: restricted.then_some(crate::announcements::LockInfo {
+                    can_view: Some(false),
+                }),
+                ..Default::default()
+            };
+            let result = if fail {
+                Err(CanvasError::NoAccess(403))
+            } else {
+                Ok((
+                    Payload::Announcement(Box::new(detail)),
+                    FetchStats::default(),
+                ))
+            };
+            app.update(Msg::Fetched {
+                key: k,
+                request: r,
+                result,
+                at: Utc::now(),
+            });
+            assert_eq!(app.announcement_status("10", &summary), "Unread");
+            if leave {
+                // The completed detail is now displayed immediately on reentry.
+                app.update(key(KeyCode::Enter));
+                assert_eq!(app.announcement_status("10", &summary), "Read");
+            }
+        }
     }
 
     #[test]

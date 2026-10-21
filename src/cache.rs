@@ -87,7 +87,11 @@ impl SnapshotStore {
     }
 
     pub fn load<T: DeserializeOwned>(&self, key: &ResourceKey) -> Option<(T, DateTime<Utc>)> {
-        let bytes = std::fs::read(self.dir.join(key.file_name()?)).ok()?;
+        self.load_named(&key.file_name()?)
+    }
+
+    fn load_named<T: DeserializeOwned>(&self, name: &str) -> Option<(T, DateTime<Utc>)> {
+        let bytes = std::fs::read(self.dir.join(name)).ok()?;
         let env: Envelope<T> = serde_json::from_slice(&bytes).ok()?;
         (env.version == VERSION && env.account == self.account)
             .then_some((env.data, env.fetched_at))
@@ -95,6 +99,10 @@ impl SnapshotStore {
 
     pub fn save<T: Serialize>(&self, key: &ResourceKey, data: &T, fetched_at: DateTime<Utc>) {
         let Some(name) = key.file_name() else { return };
+        self.save_named(&name, data, fetched_at);
+    }
+
+    fn save_named<T: Serialize>(&self, name: &str, data: &T, fetched_at: DateTime<Utc>) {
         let env = Envelope {
             version: VERSION,
             account: self.account.clone(),
@@ -107,7 +115,7 @@ impl SnapshotStore {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
-        let path = self.dir.join(&name);
+        let path = self.dir.join(name);
         let tmp = self.dir.join(format!("{name}.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -116,6 +124,17 @@ impl SnapshotStore {
 
     pub fn clear(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
+    /// Local reading history is separate from refreshed Canvas snapshots.
+    pub fn announcement_reads(&self) -> std::collections::BTreeSet<(String, String)> {
+        self.load_named("local-announcement-reads.json")
+            .map(|(reads, _)| reads)
+            .unwrap_or_default()
+    }
+
+    pub fn save_announcement_reads(&self, reads: &std::collections::BTreeSet<(String, String)>) {
+        self.save_named("local-announcement-reads.json", reads, Utc::now());
     }
 }
 

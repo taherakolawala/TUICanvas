@@ -703,11 +703,13 @@ fn draw_announcements(
                 .style(theme::muted()),
                 Cell::from(html::sanitize(a.title())),
                 Cell::from(html::sanitize(a.author())).style(theme::muted()),
-                Cell::from(a.status()).style(if a.status() == "Unread" {
-                    theme::tab_active()
-                } else {
-                    theme::muted()
-                }),
+                Cell::from(app.announcement_status(course_id, a)).style(
+                    if app.announcement_status(course_id, a) == "Unread" {
+                        theme::tab_active()
+                    } else {
+                        theme::muted()
+                    },
+                ),
             ]);
             if start + i == app.view().selected {
                 row.style(theme::selected())
@@ -1419,7 +1421,7 @@ fn draw_announcement(
             a.date()
                 .map(long_date)
                 .unwrap_or_else(|| "Date unavailable".into()),
-            a.status()
+            app.announcement_status(course_id, a)
         )),
     ];
     if let Some(n) = a.discussion_subentry_count.filter(|n| *n > 0) {
@@ -1583,6 +1585,7 @@ mod tests {
         let rendered = screen(&mut app, 100, 18);
         println!("{rendered}\n");
         assert!(rendered.contains("Meet in room 200.") && rendered.contains("Schedule"));
+        assert!(rendered.contains("Read") && !rendered.contains("Unread"));
         let effects = send(&mut app, KeyCode::Char('r'));
         assert!(screen(&mut app, 100, 18).contains("Syncing"));
         let crate::app::Effect::Fetch { key, request } = effects[0].clone() else {
