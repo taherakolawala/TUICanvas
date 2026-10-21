@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Canvas IDs arrive as strings (we request canvas-string-ids), but accept numbers too.
-fn de_id<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+pub(crate) fn de_id<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Id {

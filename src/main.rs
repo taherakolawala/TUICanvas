@@ -1,5 +1,6 @@
 //! TUICanvas: a keyboard-driven terminal reader for Canvas.
 
+mod announcements;
 mod api;
 mod app;
 mod bench;
