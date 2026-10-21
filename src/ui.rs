@@ -114,15 +114,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ViewKind::Assignments { course_id, .. } => {
             let [tabs, body] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-            draw_tabs(frame, tabs, false);
+            draw_tabs(frame, tabs, 0);
             draw_assignments(frame, body, app, &course_id, now)
         }
         ViewKind::Files { course_id, .. } => {
             let [tabs, body] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-            draw_tabs(frame, tabs, true);
+            draw_tabs(frame, tabs, 1);
             draw_files(frame, body, app, &course_id, now)
         }
+        ViewKind::Announcements { course_id, .. } => {
+            let [tabs, body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+            draw_tabs(frame, tabs, 2);
+            draw_announcements(frame, body, app, &course_id, now);
+        }
+        ViewKind::Announcement {
+            course_id,
+            course_name,
+            announcement_id,
+            ..
+        } => draw_announcement(frame, main, app, &course_id, &announcement_id, &course_name),
         ViewKind::Detail {
             course_id,
             course_name,
@@ -193,6 +205,29 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         } => {
             crumbs.push(course_name.clone());
             sync_text(app.assignments.get(course_id), app.spinner, now)
+        }
+        ViewKind::Announcements {
+            course_id,
+            course_name,
+        } => {
+            crumbs.push(course_name.clone());
+            crumbs.push("Announcements".into());
+            sync_text(app.announcements.get(course_id), app.spinner, now)
+        }
+        ViewKind::Announcement {
+            course_id,
+            course_name,
+            announcement_id,
+            title,
+        } => {
+            crumbs.push(course_name.clone());
+            crumbs.push(title.clone());
+            sync_text(
+                app.announcement_details
+                    .get(&(course_id.clone(), announcement_id.clone())),
+                app.spinner,
+                now,
+            )
         }
         ViewKind::Detail {
             course_id,
@@ -304,10 +339,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 ("o", "browser"),
                 ("q", "quit"),
             ],
-            ViewKind::Assignments { .. } => &[
+            ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => &[
                 ("↑↓", "move"),
                 ("Enter", "open"),
-                ("Tab", "files"),
+                ("Tab", "switch"),
                 ("Esc", "back"),
                 ("/", "filter"),
                 ("r", "refresh"),
@@ -320,10 +355,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 ("D", "all"),
                 ("e", "folder"),
                 ("/", "search"),
-                ("Tab", "assignments"),
+                ("Tab", "switch"),
                 ("Esc", "back"),
                 ("o", "browser"),
                 ("r", "refresh"),
+            ],
+            ViewKind::Announcement { .. } => &[
+                ("↑↓", "scroll"),
+                ("Tab", "links"),
+                ("Enter", "open"),
+                ("d/D", "download"),
+                ("Esc", "back"),
+                ("r", "refresh"),
+                ("o", "browser"),
+                ("q", "quit"),
             ],
             ViewKind::Detail {
                 ref course_id,
@@ -618,8 +663,79 @@ fn draw_assignments(
     );
 }
 
+fn draw_announcements(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    course_id: &str,
+    now: DateTime<Utc>,
+) {
+    if placeholder(
+        frame,
+        area,
+        app.announcements.get(course_id),
+        "announcements",
+    ) {
+        return;
+    }
+    let rows = app.visible_rows();
+    if rows.is_empty() {
+        empty_message(frame, area, &app.view().filter, "announcements");
+        return;
+    }
+    let (start, end) = window(app, rows.len(), usize::from(area.height.saturating_sub(1)));
+    let list = app
+        .announcements
+        .get(course_id)
+        .and_then(|r| r.data.as_deref())
+        .unwrap_or(&[]);
+    let built: Vec<Row> = rows[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, &index)| {
+            let a = &list[index];
+            let row = Row::new(vec![
+                Cell::from(
+                    a.date()
+                        .map(|d| short_date(d, now))
+                        .unwrap_or_else(|| "Unknown date".into()),
+                )
+                .style(theme::muted()),
+                Cell::from(html::sanitize(a.title())),
+                Cell::from(html::sanitize(a.author())).style(theme::muted()),
+                Cell::from(a.status()).style(if a.status() == "Unread" {
+                    theme::tab_active()
+                } else {
+                    theme::muted()
+                }),
+            ]);
+            if start + i == app.view().selected {
+                row.style(theme::selected())
+            } else {
+                row
+            }
+        })
+        .collect();
+    let wide = area.width >= 80;
+    let widths = [
+        Constraint::Length(if area.width >= 60 { 20 } else { 0 }),
+        Constraint::Fill(1),
+        Constraint::Length(if wide { 20 } else { 0 }),
+        Constraint::Length(7),
+    ];
+    frame.render_widget(
+        Table::new(built, widths)
+            .header(
+                Row::new(["Posted", "Announcement", "Author", "Status"])
+                    .style(theme::table_header()),
+            )
+            .column_spacing(1),
+        area,
+    );
+}
+
 /// `Assignments  Files` for a course, the current one highlighted.
-fn draw_tabs(frame: &mut Frame, area: Rect, files: bool) {
+fn draw_tabs(frame: &mut Frame, area: Rect, active: usize) {
     let tab = |label: &str, on: bool| {
         Span::styled(
             label.to_string(),
@@ -632,9 +748,11 @@ fn draw_tabs(frame: &mut Frame, area: Rect, files: bool) {
     };
     let spans = vec![
         Span::raw(" "),
-        tab("Assignments", !files),
+        tab("Assignments", active == 0),
         Span::styled(" │ ", theme::faint()),
-        tab("Files", files),
+        tab("Files", active == 1),
+        Span::styled(" │ ", theme::faint()),
+        tab("Announcements", active == 2),
         Span::styled("   Tab", theme::key()),
         Span::styled(" switch", theme::faint()),
     ];
@@ -840,6 +958,9 @@ fn link_row(app: &App, link: &Link) -> (String, String, String, (String, Style))
             let state = match (meta, app.files.get(id).map(|r| &r.sync)) {
                 (Some(f), _) => local_text(&app.local_state(f)),
                 (None, Some(SyncState::Failed(_))) => ("no access".into(), theme::error()),
+                (None, None) if matches!(app.view().kind, ViewKind::Announcement { .. }) => {
+                    ("on demand".into(), theme::faint())
+                }
                 (None, _) => ("…".into(), theme::faint()),
             };
             (kind.into(), name, size, state)
@@ -1233,6 +1354,131 @@ fn draw_detail(
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+fn draw_announcement(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    course_id: &str,
+    announcement_id: &str,
+    course: &str,
+) {
+    let key = (course_id.to_string(), announcement_id.to_string());
+    if placeholder(
+        frame,
+        area,
+        app.announcement_details.get(&key),
+        "announcement",
+    ) {
+        return;
+    }
+    // Files and links get a fixed list at the bottom, so they stay in view while reading.
+    let links = app.announcement_links(course_id, announcement_id);
+    let area = if links.is_empty() {
+        area
+    } else {
+        let cap = if area.height >= 24 {
+            6
+        } else if area.height >= 16 {
+            4
+        } else {
+            2
+        };
+        let rows = links.len().min(cap) as u16;
+        let [text, panel] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(rows + 1)]).areas(area);
+        let selected = app.view().link.filter(|&i| i < links.len());
+        draw_links(frame, panel, app, &links, selected);
+        text
+    };
+    let res = &app.announcement_details[&key];
+    let detail = res.data.as_ref().expect("checked");
+    let text_width = area.width.saturating_sub(2).min(110);
+    let stale = !matches!(&app.announcement_render, Some(r) if r.key == key && r.version == res.version && r.width == text_width);
+    if stale {
+        let lines = html::render(
+            // Canvas already returns a visibility explanation instead of the
+            // message when access is restricted. A comment lock is not a read lock.
+            detail.message.as_deref().unwrap_or(""),
+            usize::from(text_width),
+            &app.origin,
+        );
+        app.announcement_render = Some(DetailRender {
+            key: key.clone(),
+            version: res.version,
+            width: text_width,
+            lines,
+        });
+    }
+    let a = &detail.base;
+    let mut lines = vec![
+        Line::styled(html::sanitize(a.title()), theme::tab_active()),
+        Line::styled(html::sanitize(course), theme::muted()),
+        Line::raw(format!(
+            "{} · {} · {}",
+            html::sanitize(a.author()),
+            a.date()
+                .map(long_date)
+                .unwrap_or_else(|| "Date unavailable".into()),
+            a.status()
+        )),
+    ];
+    if let Some(n) = a.discussion_subentry_count.filter(|n| *n > 0) {
+        lines.push(Line::styled(
+            format!("{n} replies · open in browser to read replies"),
+            theme::muted(),
+        ));
+    }
+    if detail.locked_for_user == Some(true) {
+        lines.push(Line::styled(
+            html::sanitize(
+                detail
+                    .lock_explanation
+                    .as_deref()
+                    .unwrap_or("Comments are unavailable."),
+            ),
+            if detail.can_view() {
+                theme::muted()
+            } else {
+                theme::failed()
+            },
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "─".repeat(usize::from(text_width)),
+        theme::faint(),
+    ));
+    let head_len = lines.len();
+    let body = &app.announcement_render.as_ref().expect("rendered").lines;
+    let body_len = body.len().max(1);
+    let height = usize::from(area.height);
+    let max_scroll = (head_len + body_len).saturating_sub(height);
+    let view = app.stack.last_mut().expect("view");
+    view.scroll = view.scroll.min(max_scroll);
+    let scroll = view.scroll;
+    let mut visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+    let body_start = scroll.saturating_sub(head_len);
+    let room = height - visible.len();
+    if body.is_empty() {
+        if room > 0 && scroll <= head_len {
+            visible.push(Line::styled("(No message)", theme::muted()));
+        }
+    } else {
+        visible.extend(
+            body.iter()
+                .skip(body_start)
+                .take(room)
+                .map(|l| style_line(l)),
+        );
+    }
+    let inner = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,6 +1535,136 @@ mod tests {
             .filter(|s| !s.content.is_empty())
             .map(|s| s.content.to_string())
             .collect()
+    }
+
+    #[test]
+    fn announcements_render_list_detail_links_and_errors_at_small_sizes() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        let send =
+            |app: &mut App, code| app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        let effects = app.start();
+        deliver(
+            &mut app,
+            effects,
+            Payload::Courses(vec![Course {
+                id: "1".into(),
+                name: Some("Course".into()),
+                ..Default::default()
+            }]),
+        );
+        let effects = send(&mut app, KeyCode::Enter);
+        deliver(&mut app, effects, Payload::Assignments(vec![]));
+        let effects = send(&mut app, KeyCode::BackTab);
+        let base = crate::announcements::Summary {
+            id: "7".into(),
+            title: Some("Exam moved".into()),
+            read_state: Some("unread".into()),
+            author: Some(crate::announcements::Author {
+                display_name: Some("Professor".into()),
+            }),
+            ..Default::default()
+        };
+        deliver(
+            &mut app,
+            effects,
+            Payload::Announcements(vec![base.clone()]),
+        );
+        let rendered = screen(&mut app, 100, 18);
+        println!("{rendered}\n");
+        assert!(
+            rendered.contains("Announcements")
+                && rendered.contains("Exam moved")
+                && rendered.contains("Unread")
+                && rendered.contains("Professor")
+        );
+        let effects = send(&mut app, KeyCode::Enter);
+        let detail = crate::announcements::Detail {base, message:Some("<h2>New room</h2><p>Meet in room 200.</p><a href='https://example.org'>Schedule</a>".into()), locked_for_user:Some(true), lock_explanation:Some("This topic is closed for comments.".into()), ..Default::default()};
+        deliver(&mut app, effects, Payload::Announcement(Box::new(detail)));
+        let rendered = screen(&mut app, 100, 18);
+        println!("{rendered}\n");
+        assert!(rendered.contains("Meet in room 200.") && rendered.contains("Schedule"));
+        let effects = send(&mut app, KeyCode::Char('r'));
+        assert!(screen(&mut app, 100, 18).contains("Syncing"));
+        let crate::app::Effect::Fetch { key, request } = effects[0].clone() else {
+            panic!("expected fetch")
+        };
+        app.update(Msg::Fetched {
+            key,
+            request,
+            result: Err(crate::canvas::CanvasError::Unauthenticated),
+            at: Utc::now(),
+        });
+        let rendered = screen(&mut app, 100, 18);
+        println!("{rendered}\n");
+        assert!(rendered.contains("Outdated") && rendered.contains("Meet in room 200."));
+        for (w, h) in [(40, 10), (20, 5), (1, 1)] {
+            let _ = screen(&mut app, w, h);
+        }
+    }
+
+    /// Replays private saved responses without printing announcement contents.
+    #[test]
+    #[ignore = "requires private saved announcement snapshots"]
+    fn saved_announcement_bodies_render() {
+        let config = crate::config::Config::load().unwrap();
+        let mut checked = 0;
+        for account in std::fs::read_dir(config.cache_root()).unwrap().flatten() {
+            if !account.path().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(account.path()).unwrap().flatten() {
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("announcement-")
+                {
+                    continue;
+                }
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+                let detail: crate::announcements::Detail =
+                    serde_json::from_value(envelope["data"].clone()).unwrap();
+                let expected =
+                    html::render(detail.message.as_deref().unwrap_or(""), 98, &config.origin);
+                if expected.is_empty() {
+                    continue;
+                }
+                let id = detail.base.id.clone();
+                let mut app = App::new(&config.origin, None);
+                app.stack.push(crate::app::View {
+                    kind: ViewKind::Announcement {
+                        course_id: "1".into(),
+                        course_name: "Course".into(),
+                        announcement_id: id.clone(),
+                        title: "Announcement".into(),
+                    },
+                    selected: 0,
+                    offset: 0,
+                    filter: String::new(),
+                    filtering: false,
+                    scroll: 0,
+                    link: None,
+                });
+                app.announcement_details.insert(
+                    ("1".into(), id),
+                    Resource {
+                        data: Some(detail),
+                        ..Default::default()
+                    },
+                );
+                let rendered = screen(&mut app, 100, 40);
+                assert!(!rendered.contains("(No message)"), "saved message hidden");
+                assert!(
+                    app.announcement_render.as_ref().unwrap().lines == expected,
+                    "saved body not rendered intact"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no saved messages to replay");
+        println!(
+            "Verified {checked} saved announcement bodies render intact (content not logged)."
+        );
     }
 
     #[test]

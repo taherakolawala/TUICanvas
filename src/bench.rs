@@ -93,6 +93,18 @@ fn current_has_data(app: &App) -> bool {
             .details
             .get(&(course_id.clone(), assignment_id.clone()))
             .is_some_and(|r| r.data.is_some()),
+        ViewKind::Announcements { course_id, .. } => app
+            .announcements
+            .get(course_id)
+            .is_some_and(|r| r.data.is_some()),
+        ViewKind::Announcement {
+            course_id,
+            announcement_id,
+            ..
+        } => app
+            .announcement_details
+            .get(&(course_id.clone(), announcement_id.clone()))
+            .is_some_and(|r| r.data.is_some()),
         ViewKind::Files { course_id, .. } => app
             .course_files
             .get(course_id)
@@ -184,7 +196,12 @@ fn find_row(app: &App, needle: &str) -> Option<usize> {
                 .get(course_id)
                 .and_then(|r| r.data.as_ref())
                 .is_some_and(|l| l[i].title().to_lowercase().contains(&needle)),
-            ViewKind::Detail { .. } => false,
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => false,
+            ViewKind::Announcements { course_id, .. } => app
+                .announcements
+                .get(course_id)
+                .and_then(|r| r.data.as_ref())
+                .is_some_and(|l| l[i].title().to_lowercase().contains(&needle)),
             ViewKind::Files { .. } => app
                 .file_rows()
                 .get(i)

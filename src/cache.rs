@@ -13,6 +13,8 @@ pub enum ResourceKey {
     Courses,
     Assignments(String),
     Detail(String, String),
+    Announcements(String),
+    Announcement(String, String),
     /// A course's Files area (folder tree and file list).
     Files(String),
     /// One Canvas file's metadata.
@@ -24,6 +26,14 @@ impl ResourceKey {
         let ok = |id: &str| crate::model::valid_id(id);
         let name = match self {
             ResourceKey::Courses => "courses".to_string(),
+            ResourceKey::Announcements(c) if ok(c) => {
+                format!("announcements-{}", c.replace('~', "_"))
+            }
+            ResourceKey::Announcement(c, a) if ok(c) && ok(a) => format!(
+                "announcement-{}-{}",
+                c.replace('~', "_"),
+                a.replace('~', "_")
+            ),
             ResourceKey::Assignments(c) if ok(c) => format!("assignments-{}", c.replace('~', "_")),
             ResourceKey::Detail(c, a) if ok(c) && ok(a) => {
                 format!("assignment-{}-{}", c.replace('~', "_"), a.replace('~', "_"))
@@ -38,6 +48,8 @@ impl ResourceKey {
     pub fn label(&self) -> &'static str {
         match self {
             ResourceKey::Courses => "courses",
+            ResourceKey::Announcements(_) => "announcements",
+            ResourceKey::Announcement(..) => "announcement",
             ResourceKey::Assignments(_) => "assignments",
             ResourceKey::Detail(..) => "assignment",
             ResourceKey::Files(_) => "files",

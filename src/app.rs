@@ -59,6 +59,8 @@ impl<T> Default for Resource<T> {
 #[derive(Debug)]
 pub enum Payload {
     Courses(Vec<Course>),
+    Announcements(Vec<crate::announcements::Summary>),
+    Announcement(Box<crate::announcements::Detail>),
     Assignments(Vec<AssignmentSummary>),
     Detail(Box<AssignmentDetail>),
     Files(Box<CourseFilesData>),
@@ -189,6 +191,16 @@ pub enum Effect {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewKind {
     Courses,
+    Announcements {
+        course_id: String,
+        course_name: String,
+    },
+    Announcement {
+        course_id: String,
+        course_name: String,
+        announcement_id: String,
+        title: String,
+    },
     Assignments {
         course_id: String,
         course_name: String,
@@ -235,6 +247,14 @@ impl View {
     pub fn key(&self) -> ResourceKey {
         match &self.kind {
             ViewKind::Courses => ResourceKey::Courses,
+            ViewKind::Announcements { course_id, .. } => {
+                ResourceKey::Announcements(course_id.clone())
+            }
+            ViewKind::Announcement {
+                course_id,
+                announcement_id,
+                ..
+            } => ResourceKey::Announcement(course_id.clone(), announcement_id.clone()),
             ViewKind::Assignments { course_id, .. } => ResourceKey::Assignments(course_id.clone()),
             ViewKind::Detail {
                 course_id,
@@ -258,6 +278,9 @@ pub struct App {
     pub origin: String,
     store: Option<Arc<SnapshotStore>>,
     pub courses: Resource<Vec<Course>>,
+    pub announcements: HashMap<String, Resource<Vec<crate::announcements::Summary>>>,
+    pub announcement_details: HashMap<(String, String), Resource<crate::announcements::Detail>>,
+    pub announcement_render: Option<DetailRender>,
     pub assignments: HashMap<String, Resource<Vec<AssignmentSummary>>>,
     pub details: HashMap<(String, String), Resource<AssignmentDetail>>,
     pub stack: Vec<View>,
@@ -323,6 +346,9 @@ impl App {
             origin: origin.to_string(),
             store,
             courses: Resource::default(),
+            announcements: HashMap::new(),
+            announcement_details: HashMap::new(),
+            announcement_render: None,
             assignments: HashMap::new(),
             details: HashMap::new(),
             stack: vec![View::new(ViewKind::Courses)],
@@ -363,7 +389,12 @@ impl App {
     fn sync_of(&self, key: &ResourceKey) -> Option<&SyncState> {
         match key {
             ResourceKey::Courses => Some(&self.courses.sync),
+            ResourceKey::Announcements(c) => self.announcements.get(c).map(|r| &r.sync),
             ResourceKey::Assignments(c) => self.assignments.get(c).map(|r| &r.sync),
+            ResourceKey::Announcement(c, a) => self
+                .announcement_details
+                .get(&(c.clone(), a.clone()))
+                .map(|r| &r.sync),
             ResourceKey::Detail(c, a) => self.details.get(&(c.clone(), a.clone())).map(|r| &r.sync),
             ResourceKey::Files(c) => self.course_files.get(c).map(|r| &r.sync),
             ResourceKey::File(f) => self.files.get(f).map(|r| &r.sync),
@@ -372,6 +403,16 @@ impl App {
 
     fn set_sync(&mut self, key: &ResourceKey, sync: SyncState) {
         match key {
+            ResourceKey::Announcements(c) => {
+                self.announcements.entry(c.clone()).or_default().sync = sync
+            }
+            ResourceKey::Announcement(c, a) => {
+                self.announcement_details
+                    .entry((c.clone(), a.clone()))
+                    .or_default()
+                    .sync = sync
+            }
+
             ResourceKey::Courses => self.courses.sync = sync,
             ResourceKey::Assignments(c) => {
                 self.assignments.entry(c.clone()).or_default().sync = sync
@@ -412,8 +453,33 @@ impl App {
                     self.courses.version += 1;
                 }
             }
+            ResourceKey::Announcements(c) => {
+                let res = self.announcements.entry(c.clone()).or_default();
+                if res.data.is_none()
+                    && let Some((data, at)) = store.load(key)
+                {
+                    res.data = Some(data);
+                    res.fetched_at = Some(at);
+                    res.origin = Origin::Cache;
+                    res.version += 1;
+                }
+            }
             ResourceKey::Assignments(c) => {
                 let res = self.assignments.entry(c.clone()).or_default();
+                if res.data.is_none()
+                    && let Some((data, at)) = store.load(key)
+                {
+                    res.data = Some(data);
+                    res.fetched_at = Some(at);
+                    res.origin = Origin::Cache;
+                    res.version += 1;
+                }
+            }
+            ResourceKey::Announcement(c, a) => {
+                let res = self
+                    .announcement_details
+                    .entry((c.clone(), a.clone()))
+                    .or_default();
                 if res.data.is_none()
                     && let Some((data, at)) = store.load(key)
                 {
@@ -554,9 +620,28 @@ impl App {
                         r.sync = SyncState::Idle;
                         r.version += 1;
                     }
+                    (Payload::Announcements(list), ResourceKey::Announcements(c)) => {
+                        let r = self.announcements.entry(c.clone()).or_default();
+                        r.data = Some(list);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
+                    }
                     (Payload::Assignments(list), ResourceKey::Assignments(c)) => {
                         let r = self.assignments.entry(c.clone()).or_default();
                         r.data = Some(list);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
+                    }
+                    (Payload::Announcement(detail), ResourceKey::Announcement(c, a)) => {
+                        let r = self
+                            .announcement_details
+                            .entry((c.clone(), a.clone()))
+                            .or_default();
+                        r.data = Some(*detail);
                         r.origin = Origin::Network;
                         r.fetched_at = Some(at);
                         r.sync = SyncState::Idle;
@@ -641,6 +726,16 @@ impl App {
                 })
                 .map(|(i, _)| i)
                 .collect(),
+            ViewKind::Announcements { course_id, .. } => self
+                .announcements
+                .get(course_id)
+                .and_then(|r| r.data.as_deref())
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| matches_filter(a.title(), &view.filter))
+                .map(|(i, _)| i)
+                .collect(),
             ViewKind::Assignments { course_id, .. } => self
                 .assignments
                 .get(course_id)
@@ -651,7 +746,7 @@ impl App {
                 .filter(|(_, a)| matches_filter(a.title(), &view.filter))
                 .map(|(i, _)| i)
                 .collect(),
-            ViewKind::Detail { .. } => vec![],
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => vec![],
             ViewKind::Files { .. } => (0..self.file_rows().len()).collect(),
         }
     }
@@ -669,7 +764,10 @@ impl App {
     }
 
     fn is_list(&self) -> bool {
-        !matches!(self.view().kind, ViewKind::Detail { .. })
+        !matches!(
+            self.view().kind,
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. }
+        )
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1379,8 +1477,10 @@ impl App {
     fn on_view_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
         let kind = self.view().kind.clone();
         match kind {
-            ViewKind::Assignments { .. } => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => Some(self.switch_tab()),
+            ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => match key.code {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    Some(self.switch_tab(key.code == KeyCode::BackTab))
+                }
                 _ => None,
             },
             ViewKind::Files {
@@ -1388,7 +1488,9 @@ impl App {
                 course_name,
                 folder_id,
             } => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => Some(self.switch_tab()),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    Some(self.switch_tab(key.code == KeyCode::BackTab))
+                }
                 KeyCode::Char('d') => {
                     let rows = self.file_rows();
                     let selected = rows.get(self.view().selected).copied();
@@ -1420,6 +1522,101 @@ impl App {
                 }
                 _ => None,
             },
+            ViewKind::Announcement {
+                course_id,
+                announcement_id,
+                ..
+            } => {
+                let links = self.announcement_links(&course_id, &announcement_id);
+                let selected = self.view().link.filter(|&i| i < links.len());
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab if !links.is_empty() => {
+                        let n = links.len();
+                        let next = match (selected, key.code) {
+                            (None, KeyCode::BackTab) => n - 1,
+                            (None, _) => 0,
+                            (Some(i), KeyCode::BackTab) => (i + n - 1) % n,
+                            (Some(i), _) => (i + 1) % n,
+                        };
+                        self.view_mut().link = Some(next);
+                        Some(vec![])
+                    }
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let i = c as usize - '1' as usize;
+                        if i < links.len() {
+                            self.view_mut().link = Some(i);
+                        }
+                        Some(vec![])
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Some(match selected {
+                        Some(i) => self.activate_announcement_link(
+                            &course_id,
+                            &announcement_id,
+                            links[i].clone(),
+                        ),
+                        None => vec![],
+                    }),
+                    KeyCode::Esc if selected.is_some() => {
+                        self.view_mut().link = None;
+                        Some(vec![])
+                    }
+                    KeyCode::Char('d') => Some(match selected.map(|i| &links[i].target) {
+                        Some(Target::File { id }) => {
+                            let id = id.clone();
+                            let dir = self.announcement_dir(&course_id, &announcement_id);
+                            self.place_announcement_file(&id, dir, false)
+                        }
+                        Some(_) => {
+                            self.notice = Some("That link is not a file.".into());
+                            vec![]
+                        }
+                        None => {
+                            self.notice = Some(
+                                "Select a file with Tab first, or press D for all files.".into(),
+                            );
+                            vec![]
+                        }
+                    }),
+                    KeyCode::Char('D') => {
+                        let dir = self.announcement_dir(&course_id, &announcement_id);
+                        let ids: Vec<String> = links
+                            .iter()
+                            .filter_map(|l| match &l.target {
+                                Target::File { id } => Some(id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        if ids.is_empty() {
+                            self.notice = Some("This announcement has no files.".into());
+                            return Some(vec![]);
+                        }
+                        let Some(dir) = dir else {
+                            self.notice = Some("The file library is unavailable.".into());
+                            return Some(vec![]);
+                        };
+                        let mut effects = Vec::new();
+                        for id in ids {
+                            effects.extend(self.place_announcement_file(
+                                &id,
+                                Some(dir.clone()),
+                                false,
+                            ));
+                        }
+                        self.notice = Some("Checking files before downloading…".into());
+                        Some(effects)
+                    }
+                    KeyCode::Char('e') => {
+                        let saved = match selected.map(|i| &links[i].target) {
+                            Some(Target::File { id }) => self.saved_path(id),
+                            _ => None,
+                        };
+                        let path =
+                            saved.or_else(|| self.announcement_dir(&course_id, &announcement_id));
+                        Some(self.reveal(path))
+                    }
+                    _ => None,
+                }
+            }
             ViewKind::Detail {
                 course_id,
                 assignment_id,
@@ -1512,26 +1709,38 @@ impl App {
         }
     }
 
-    /// Assignments <-> Files for the same course. Leaving Files leaves all its folders.
-    fn switch_tab(&mut self) -> Vec<Effect> {
-        let next = match &self.view().kind {
+    /// Cycle course tabs; leaving Files leaves its nested folders.
+    fn switch_tab(&mut self, backwards: bool) -> Vec<Effect> {
+        let (course_id, course_name, index) = match &self.view().kind {
             ViewKind::Assignments {
                 course_id,
                 course_name,
-            } => ViewKind::Files {
-                course_id: course_id.clone(),
-                course_name: course_name.clone(),
-                folder_id: None,
-            },
+            } => (course_id.clone(), course_name.clone(), 0),
             ViewKind::Files {
                 course_id,
                 course_name,
                 ..
-            } => ViewKind::Assignments {
-                course_id: course_id.clone(),
-                course_name: course_name.clone(),
-            },
+            } => (course_id.clone(), course_name.clone(), 1),
+            ViewKind::Announcements {
+                course_id,
+                course_name,
+            } => (course_id.clone(), course_name.clone(), 2),
             _ => return vec![],
+        };
+        let next = match (index + if backwards { 2 } else { 1 }) % 3 {
+            0 => ViewKind::Assignments {
+                course_id,
+                course_name,
+            },
+            1 => ViewKind::Files {
+                course_id,
+                course_name,
+                folder_id: None,
+            },
+            _ => ViewKind::Announcements {
+                course_id,
+                course_name,
+            },
         };
         while self.stack.len() > 1
             && matches!(
@@ -1552,6 +1761,73 @@ impl App {
                 self.notice = Some("The file library is unavailable.".into());
                 vec![]
             }
+        }
+    }
+
+    pub fn announcement_links(&self, course_id: &str, id: &str) -> Vec<Link> {
+        let Some(detail) = self
+            .announcement_details
+            .get(&(course_id.into(), id.into()))
+            .and_then(|r| r.data.as_ref())
+        else {
+            return vec![];
+        };
+        if !detail.can_view() {
+            return vec![];
+        }
+        let mut links = crate::html::links(detail.message.as_deref().unwrap_or(""), &self.origin);
+        for f in &detail.attachments {
+            if crate::model::valid_id(&f.id)
+                && !links
+                    .iter()
+                    .any(|l| matches!(&l.target, Target::File {id} if id == &f.id))
+            {
+                links.push(Link {
+                    text: crate::html::sanitize(f.name()),
+                    url: format!("{}/courses/{course_id}/files/{}", self.origin, f.id),
+                    target: Target::File { id: f.id.clone() },
+                    image: false,
+                });
+            }
+        }
+        links
+    }
+
+    pub fn announcement_dir(&self, course_id: &str, id: &str) -> Option<PathBuf> {
+        let lib = self.library.as_ref()?;
+        Some(
+            lib.root()
+                .join(self.course_dir(course_id, &self.course_title(course_id)))
+                .join("Announcement Files")
+                .join(id),
+        )
+    }
+
+    /// File metadata is lazy for announcements; validate it when a file is
+    /// chosen so a saved URL or version never suppresses this fresh read.
+    fn place_announcement_file(
+        &mut self,
+        id: &str,
+        dir: Option<PathBuf>,
+        open: bool,
+    ) -> Vec<Effect> {
+        if dir.is_none() {
+            return self.place_from(id, dir, open);
+        }
+        let mut effects: Vec<_> = self
+            .request(ResourceKey::File(id.into()), false)
+            .into_iter()
+            .collect();
+        effects.extend(self.place_from(id, dir, open));
+        effects
+    }
+
+    fn activate_announcement_link(&mut self, course_id: &str, id: &str, link: Link) -> Vec<Effect> {
+        if let Target::File { id: file_id } = &link.target {
+            let dir = self.announcement_dir(course_id, id);
+            self.place_announcement_file(file_id, dir, true)
+        } else {
+            self.activate_link(course_id, id, link)
         }
     }
 
@@ -1596,6 +1872,25 @@ impl App {
                     course_name: course.title().to_string(),
                 }
             }
+            ViewKind::Announcements {
+                course_id,
+                course_name,
+            } => {
+                let Some(a) = self
+                    .announcements
+                    .get(course_id)
+                    .and_then(|r| r.data.as_ref())
+                    .and_then(|l| l.get(index))
+                else {
+                    return vec![];
+                };
+                ViewKind::Announcement {
+                    course_id: course_id.clone(),
+                    course_name: course_name.clone(),
+                    announcement_id: a.id.clone(),
+                    title: a.title().to_string(),
+                }
+            }
             ViewKind::Assignments {
                 course_id,
                 course_name,
@@ -1615,7 +1910,7 @@ impl App {
                     title: a.title().to_string(),
                 }
             }
-            ViewKind::Detail { .. } => return vec![],
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => return vec![],
             ViewKind::Files {
                 course_id,
                 course_name,
@@ -1653,6 +1948,39 @@ impl App {
     pub fn browser_url(&self) -> Option<String> {
         let same_origin = |u: &str| u.starts_with(&format!("{}/", self.origin));
         match &self.view().kind {
+            ViewKind::Announcements { course_id, .. } => {
+                let base = format!("{}/courses/{course_id}/announcements", self.origin);
+                let rows = self.visible_rows();
+                let item = rows
+                    .get(self.view().selected)
+                    .and_then(|i| self.announcements.get(course_id)?.data.as_ref()?.get(*i));
+                Some(
+                    item.map(|a| {
+                        format!(
+                            "{}/courses/{course_id}/discussion_topics/{}",
+                            self.origin, a.id
+                        )
+                    })
+                    .unwrap_or(base),
+                )
+            }
+            ViewKind::Announcement {
+                course_id,
+                announcement_id,
+                ..
+            } => {
+                if let Some(i) = self.view().link {
+                    return self
+                        .announcement_links(course_id, announcement_id)
+                        .get(i)
+                        .map(|l| l.url.clone());
+                }
+                Some(format!(
+                    "{}/courses/{course_id}/discussion_topics/{announcement_id}",
+                    self.origin
+                ))
+            }
+
             ViewKind::Detail {
                 course_id,
                 assignment_id,
@@ -2072,13 +2400,157 @@ mod tests {
         app.update(key(KeyCode::Enter));
         app.update(key(KeyCode::Enter));
         assert_eq!(app.stack.len(), 4);
-        let (k, _) = fetch_of(&app.update(key(KeyCode::Tab)));
+        let (k, _) = fetch_of(&app.update(key(KeyCode::BackTab)));
         assert_eq!(k, ResourceKey::Assignments("10".into()));
         assert_eq!(app.stack.len(), 2);
         assert!(matches!(app.view().kind, ViewKind::Assignments { .. }));
         let (k, _) = fetch_of(&app.update(key(KeyCode::Tab)));
         assert_eq!(k, ResourceKey::Files("10".into()));
         assert_eq!(app.stack.len(), 2);
+    }
+
+    #[test]
+    fn announcements_navigate_filter_refresh_and_ignore_old_responses() {
+        let mut app = files_app(None);
+        let (k, r) = fetch_of(&app.update(key(KeyCode::Tab)));
+        assert_eq!(k, ResourceKey::Announcements("10".into()));
+        let a = crate::announcements::Summary {
+            id: "8".into(),
+            title: Some("Exam update".into()),
+            ..Default::default()
+        };
+        deliver(&mut app, k.clone(), r, Payload::Announcements(vec![a]));
+        assert_eq!(app.visible_rows(), [0]);
+        app.update(key(KeyCode::Char('/')));
+        for c in "exam".chars() {
+            app.update(key(KeyCode::Char(c)));
+        }
+        app.update(key(KeyCode::Enter));
+        let (detail_key, request) = fetch_of(&app.update(key(KeyCode::Enter)));
+        assert_eq!(
+            detail_key,
+            ResourceKey::Announcement("10".into(), "8".into())
+        );
+        let detail = crate::announcements::Detail {
+            base: crate::announcements::Summary {
+                id: "8".into(),
+                ..Default::default()
+            },
+            message: Some("<a href='/courses/10/files/9/download'>Notes</a>".into()),
+            attachments: vec![
+                canvas_file("9", "notes.pdf", "1"),
+                canvas_file("11", "extra.txt", "1"),
+            ],
+            ..Default::default()
+        };
+        deliver(
+            &mut app,
+            detail_key,
+            request,
+            Payload::Announcement(Box::new(detail)),
+        );
+        assert_eq!(app.announcement_links("10", "8").len(), 2);
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(app.view().scroll, 1);
+        app.update(key(KeyCode::Tab));
+        assert!(app.browser_url().unwrap().ends_with("/files/9/download"));
+        app.update(key(KeyCode::Esc)); // deselect link
+        assert_eq!(fetch_of(&app.update(key(KeyCode::Esc))).0, k);
+        let (_, newer) = fetch_of(&app.update(key(KeyCode::Char('r'))));
+        deliver(&mut app, k.clone(), r, Payload::Announcements(vec![]));
+        assert_eq!(app.visible_rows(), [0]);
+        app.update(Msg::Fetched {
+            key: k,
+            request: newer,
+            result: Err(CanvasError::NoAccess(403)),
+            at: Utc::now(),
+        });
+        assert!(matches!(app.announcements["10"].sync, SyncState::Failed(_)));
+        assert_eq!(app.visible_rows(), [0]);
+        // Forward wraps to Assignments; backward wraps to Announcements.
+        let effects = app.update(key(KeyCode::Tab));
+        assert_eq!(fetch_of(&effects).0, ResourceKey::Assignments("10".into()));
+        let effects = app.update(key(KeyCode::BackTab));
+        assert_eq!(
+            fetch_of(&effects).0,
+            ResourceKey::Announcements("10".into())
+        );
+    }
+
+    #[test]
+    fn announcement_file_choices_refresh_metadata_before_reusing_local_files() {
+        let (library, root) = temp_library("announcement-file");
+        let mut app = app_with_courses();
+        app.library = Some(library);
+        let dir = app.announcement_dir("10", "8");
+        let effects = app.place_announcement_file("9", dir.clone(), true);
+        assert_eq!(fetch_of(&effects).0, ResourceKey::File("9".into()));
+        let effects = deliver_file(&mut app, canvas_file("9", "notes.pdf", "1"));
+        let download = effects
+            .iter()
+            .find(|e| matches!(e, Effect::Download { .. }))
+            .unwrap();
+        let result = finish_download(&mut app, download, "notes");
+        assert!(result.iter().any(|e| matches!(e, Effect::OpenPath(_))));
+        // Even with a saved copy, check its current Canvas version on the next choice.
+        let effects = app.place_announcement_file("9", dir, true);
+        assert_eq!(fetch_of(&effects).0, ResourceKey::File("9".into()));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::OpenPath(_))));
+        let effects = deliver_file(&mut app, canvas_file("9", "notes.pdf", "1"));
+        assert!(effects.iter().any(|e| matches!(e, Effect::OpenPath(_))));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Download { .. })));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn announcement_snapshots_show_while_syncing_and_closed_comments_keep_links() {
+        let root =
+            std::env::temp_dir().join(format!("tuicanvas-announcements-{}", std::process::id()));
+        let store = Arc::new(SnapshotStore::new(&root, "test"));
+        let key = ResourceKey::Announcements("10".into());
+        store.save(
+            &key,
+            &vec![crate::announcements::Summary {
+                id: "8".into(),
+                title: Some("Saved notice".into()),
+                ..Default::default()
+            }],
+            Utc::now(),
+        );
+        let mut app = App::new("https://ufl.instructure.com", Some(store));
+        app.stack.push(View::new(ViewKind::Announcements {
+            course_id: "10".into(),
+            course_name: "Course".into(),
+        }));
+        let effects = app.enter_current(false);
+        assert_eq!(fetch_of(&effects).0, key);
+        assert_eq!(app.announcements["10"].origin, Origin::Cache);
+        assert!(app.current_syncing());
+        assert_eq!(app.visible_rows(), [0]);
+        let (key, request) = fetch_of(&app.update(super::tests::key(KeyCode::Enter)));
+        let d = crate::announcements::Detail {
+            base: crate::announcements::Summary {
+                id: "8".into(),
+                ..Default::default()
+            },
+            message: Some("<a href='https://example.org'>Schedule</a>".into()),
+            locked_for_user: Some(true),
+            ..Default::default()
+        };
+        deliver(&mut app, key, request, Payload::Announcement(Box::new(d)));
+        assert_eq!(app.announcement_links("10", "8").len(), 1);
+        let d = app
+            .announcement_details
+            .get_mut(&("10".into(), "8".into()))
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap();
+        d.lock_info = Some(crate::announcements::LockInfo {
+            can_view: Some(false),
+        });
+        assert!(app.announcement_links("10", "8").is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
