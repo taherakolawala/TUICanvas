@@ -613,8 +613,11 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) {
         )),
         rule,
     );
-    if bottom.height >= 6 {
-        draw_month(frame, bottom, app, now);
+    // The calendar takes the left half; the right half is kept for other widgets.
+    let [calendar, _widgets] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(bottom);
+    if calendar.height >= 6 {
+        draw_month(frame, calendar, app, now);
     }
 }
 
@@ -2520,7 +2523,7 @@ mod tests {
             home.contains("Sun")
                 && home.contains("Sat")
                 && home.contains("Lab-3")
-                && home.contains("!Quiz 4"),
+                && home.contains("!Quiz"),
             "{home}"
         );
         assert!(
