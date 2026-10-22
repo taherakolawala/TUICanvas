@@ -95,11 +95,15 @@ pub enum Scope {
     /// Courses, assignments, announcements, files.
     List,
     Courses,
-    /// The lists inside a course (Assignments, Files, Announcements).
+    /// A course's sections (Home, Assignments, Announcements, Files, Modules).
     CourseTabs,
     Files,
-    /// An assignment or announcement.
+    /// An assignment, announcement or course page.
     Page,
+    /// A page whose `Tab` moves between its sections: every page but a
+    /// course's Home, where `Tab` moves between the course's tabs and
+    /// `1`–`9` reach the links.
+    Sections,
     /// A page that has files or links.
     HasLinks,
     /// The files & links section has focus.
@@ -331,10 +335,16 @@ pub static BINDINGS: &[Binding] = &[
         .hint(6),
     b(Act::PrevSection, &[BACKTAB], &[Courses], "calendar")
         .title("Switch between the courses and the calendar"),
-    b(Act::NextSection, &[TAB], &[Page], "next section")
+    b(Act::NextSection, &[TAB], &[Sections], "next section")
         .title("Next section (text, files & links, submissions)")
         .hint(5),
-    b(Act::PrevSection, &[BACKTAB], &[Page], "previous section").title("Previous section"),
+    b(
+        Act::PrevSection,
+        &[BACKTAB],
+        &[Sections],
+        "previous section",
+    )
+    .title("Previous section"),
     // Screen-wide.
     b(Act::Search, &[ch('/')], &[List], "search")
         .title("Search this list")
@@ -625,14 +635,17 @@ mod tests {
             vec![Screen, Courses, Day],
             vec![Screen, List, CourseTabs],
             vec![Screen, List, CourseTabs, Files],
-            vec![Screen, Page],
-            vec![Screen, Page, HasLinks],
-            vec![Screen, Page, HasLinks, Links],
-            vec![Screen, Page, Assignment],
-            vec![Screen, Page, Assignment, HasLinks],
-            vec![Screen, Page, Assignment, HasLinks, Links],
-            vec![Screen, Page, Assignment, Submissions],
-            vec![Screen, Page, Assignment, HasLinks, Submissions],
+            vec![Screen, Page, Sections],
+            vec![Screen, Page, Sections, HasLinks],
+            vec![Screen, Page, Sections, HasLinks, Links],
+            vec![Screen, Page, Sections, Assignment],
+            vec![Screen, Page, Sections, Assignment, HasLinks],
+            vec![Screen, Page, Sections, Assignment, HasLinks, Links],
+            vec![Screen, Page, Sections, Assignment, Submissions],
+            vec![Screen, Page, Sections, Assignment, HasLinks, Submissions],
+            vec![Screen, Page, CourseTabs],
+            vec![Screen, Page, CourseTabs, HasLinks],
+            vec![Screen, Page, CourseTabs, HasLinks, Links],
         ];
         let signed_out: Vec<Vec<Scope>> = out
             .iter()

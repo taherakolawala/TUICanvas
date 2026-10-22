@@ -58,6 +58,9 @@ impl ResourceKey {
             ResourceKey::File(f) if ok(f) => format!("file-{}", f.replace('~', "_")),
             ResourceKey::Tabs(c) if ok(c) => format!("tabs-{}", c.replace('~', "_")),
             ResourceKey::Modules(c) if ok(c) => format!("modules-{}", c.replace('~', "_")),
+            ResourceKey::WikiPage(c, u) if ok(c) && u == crate::modules::FRONT_PAGE => {
+                format!("home-{}", c.replace('~', "_"))
+            }
             ResourceKey::WikiPage(c, u) if ok(c) && crate::modules::valid_slug(u) => {
                 format!("page-{}-{u}", c.replace('~', "_"))
             }

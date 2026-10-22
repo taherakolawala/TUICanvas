@@ -191,6 +191,10 @@ pub fn valid_slug(slug: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
+/// Stands for the course's front page (its Canvas Home when the home is a
+/// page). Never a real page name: those cannot start with a dot.
+pub const FRONT_PAGE: &str = ".front";
+
 /// A wiki page with its text.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WikiPage {
@@ -287,12 +291,14 @@ pub async fn page(
     url: &str,
 ) -> Result<(WikiPage, FetchStats), CanvasError> {
     check(course)?;
-    if !valid_slug(url) {
+    let path = if url == FRONT_PAGE {
+        format!("/api/v1/courses/{course}/front_page")
+    } else if valid_slug(url) {
+        format!("/api/v1/courses/{course}/pages/{url}")
+    } else {
         return Err(CanvasError::Invalid("invalid page name"));
-    }
-    let (page, stats): (WikiPage, _) = client
-        .get_json(&format!("/api/v1/courses/{course}/pages/{url}"))
-        .await?;
+    };
+    let (page, stats): (WikiPage, _) = client.get_json(&path).await?;
     // Canvas may answer with the page under its current name after a rename.
     if page.url.as_deref().is_some_and(|u| !valid_slug(u)) {
         return Err(CanvasError::Invalid("unexpected page"));
@@ -354,6 +360,14 @@ mod tests {
             r#"{"url":"week-1","title":"Week 1","body":"<p>Hi</p>"}"#,
         )]);
         let (p, _) = page(&client(t), "10", "week-1").await.unwrap();
+        let t = FakeTransport::new(vec![json(200, r#"{"url":"welcome","title":"Welcome"}"#)]);
+        let (p2, _) = page(&client(t.clone()), "10", FRONT_PAGE).await.unwrap();
+        assert_eq!(p2.title(), "Welcome");
+        assert!(
+            t.requests.lock().unwrap()[0]
+                .url
+                .ends_with("/courses/10/front_page")
+        );
         assert_eq!(p.title(), "Week 1");
         assert!(valid_slug("week-1_notes.v2"));
         assert!(!valid_slug(".hidden"));
@@ -397,12 +411,23 @@ mod tests {
                 }
                 _ => None,
             };
+            let front = if course.default_view.as_deref() == Some("wiki") {
+                let read = page(&client, &course.id, FRONT_PAGE).await;
+                Some(match read {
+                    Ok((p, s)) => {
+                        serde_json::json!({"ok": true, "links": crate::html::links(p.body.as_deref().unwrap_or(""), &config.origin).len(), "ms": s.ms})
+                    }
+                    Err(e) => serde_json::json!({"ok": false, "error": e.describe()}),
+                })
+            } else {
+                None
+            };
             report.push(serde_json::json!({
                 "tabs": tabs.iter().map(|t| t.id.as_str()).filter(|id| !id.starts_with("context_external_tool")).collect::<Vec<_>>(),
                 "default_view": course.default_view,
                 "modules": mods.len(), "items": items.len(), "kinds": kinds,
                 "unsafe_page_names": items.iter().filter(|i| i.kind() == ItemKind::Page && i.page().is_none()).count(),
-                "tabs_read": tab_stats, "modules_read": stats, "page_read": page_stats,
+                "tabs_read": tab_stats, "modules_read": stats, "page_read": page_stats, "front_page": front,
             }));
         }
         let path = config.private_reports().join("modules-live.json");
@@ -411,7 +436,7 @@ mod tests {
         for r in &report {
             println!(
                 "{}",
-                serde_json::json!({"tabs": r["tabs"], "home": r["default_view"], "modules": r["modules"], "items": r["items"], "kinds": r["kinds"], "unsafe": r["unsafe_page_names"]})
+                serde_json::json!({"tabs": r["tabs"], "home": r["default_view"], "modules": r["modules"], "items": r["items"], "kinds": r["kinds"], "unsafe": r["unsafe_page_names"], "front": r["front_page"]})
             );
         }
         println!(

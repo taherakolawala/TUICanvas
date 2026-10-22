@@ -93,6 +93,8 @@ impl ModuleRow<'_> {
 /// A course section the reader can show, when Canvas shows its tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CourseTab {
+    /// The course's Canvas home, when it is a page.
+    Home,
     Assignments,
     Announcements,
     Files,
@@ -102,6 +104,7 @@ pub enum CourseTab {
 impl CourseTab {
     pub fn label(self) -> &'static str {
         match self {
+            CourseTab::Home => "Home",
             CourseTab::Assignments => "Assignments",
             CourseTab::Announcements => "Announcements",
             CourseTab::Files => "Files",
@@ -121,6 +124,12 @@ impl CourseTab {
 
     pub fn view(self, course_id: String, course_name: String) -> ViewKind {
         match self {
+            CourseTab::Home => ViewKind::WikiPage {
+                course_id,
+                course_name,
+                page_url: crate::modules::FRONT_PAGE.to_string(),
+                title: "Home".into(),
+            },
             CourseTab::Assignments => ViewKind::Assignments {
                 course_id,
                 course_name,
@@ -414,6 +423,14 @@ impl ViewKind {
                 course_id,
                 course_name,
             } => Some((CourseTab::Modules, course_id, course_name)),
+            ViewKind::WikiPage {
+                course_id,
+                course_name,
+                page_url,
+                ..
+            } if page_url == crate::modules::FRONT_PAGE => {
+                Some((CourseTab::Home, course_id, course_name))
+            }
             _ => None,
         }
     }
@@ -1395,27 +1412,38 @@ impl App {
     /// first when it is modules or assignments, since Canvas shows those on
     /// Home even with their own tab hidden. Before the tabs are known, all.
     pub fn course_tabs(&self, course_id: &str) -> Vec<CourseTab> {
-        let Some(list) = self.tabs.get(course_id).and_then(|r| r.data.as_ref()) else {
-            return vec![
-                CourseTab::Assignments,
-                CourseTab::Files,
-                CourseTab::Announcements,
-                CourseTab::Modules,
-            ];
-        };
-        let home = self
+        // Canvas's Home shows the course's default view: a page, modules or
+        // assignments (a syllabus or activity feed home is not shown here).
+        let home = match self
             .courses
             .data
             .as_deref()
             .unwrap_or(&[])
             .iter()
             .find(|c| c.id == course_id)
-            .and_then(|c| c.default_view.as_deref());
-        let mut out = Vec::new();
-        match home {
-            Some("modules") => out.push(CourseTab::Modules),
-            Some("assignments") => out.push(CourseTab::Assignments),
-            _ => {}
+            .and_then(|c| c.default_view.as_deref())
+        {
+            Some("wiki") => Some(CourseTab::Home),
+            Some("modules") => Some(CourseTab::Modules),
+            Some("assignments") => Some(CourseTab::Assignments),
+            _ => None,
+        };
+        let mut out: Vec<CourseTab> = home.into_iter().collect();
+        let Some(list) = self.tabs.get(course_id).and_then(|r| r.data.as_ref()) else {
+            for tab in [
+                CourseTab::Assignments,
+                CourseTab::Files,
+                CourseTab::Announcements,
+                CourseTab::Modules,
+            ] {
+                if !out.contains(&tab) {
+                    out.push(tab);
+                }
+            }
+            return out;
+        };
+        if !list.iter().any(|t| t.id == "home") {
+            out.clear();
         }
         for tab in list.iter().filter_map(|t| CourseTab::of_canvas(&t.id)) {
             if !out.contains(&tab) {
@@ -2198,6 +2226,12 @@ impl App {
             ViewKind::CourseHome { .. } => {}
             ViewKind::Detail { .. } | ViewKind::Announcement { .. } | ViewKind::WikiPage { .. } => {
                 scopes.push(Scope::Page);
+                // On a course's Home, Tab moves between the course's tabs.
+                scopes.push(if view.kind.tab().is_some() {
+                    Scope::CourseTabs
+                } else {
+                    Scope::Sections
+                });
                 if matches!(view.kind, ViewKind::Detail { .. }) {
                     scopes.push(Scope::Assignment);
                 }
@@ -2504,11 +2538,11 @@ impl App {
             Act::Back => self.go_back(),
             Act::NextSection | Act::PrevSection => {
                 let forward = act == Act::NextSection;
-                if page.is_some() || self.view().kind == ViewKind::Courses {
+                if self.view().kind.tab().is_some() {
+                    self.switch_tab(!forward)
+                } else {
                     self.cycle_section(forward);
                     vec![]
-                } else {
-                    self.switch_tab(!forward)
                 }
             }
             Act::Search => {
@@ -3713,7 +3747,11 @@ impl App {
                     .and_then(|p| p.html_url.clone())
                     .filter(|u| same_origin(u));
                 Some(html.unwrap_or_else(|| {
-                    format!("{}/courses/{course_id}/pages/{page_url}", self.origin)
+                    if page_url == crate::modules::FRONT_PAGE {
+                        format!("{}/courses/{course_id}", self.origin)
+                    } else {
+                        format!("{}/courses/{course_id}/pages/{page_url}", self.origin)
+                    }
                 }))
             }
             ViewKind::CourseHome { course_id, .. } => {
@@ -5263,5 +5301,57 @@ mod tests {
             app.selected_module_row(),
             Some(ModuleRow::Item(_, i)) if i.title() == "Quiz 1"
         ));
+    }
+
+    #[test]
+    fn a_page_home_is_the_home_tab_where_tab_changes_tabs_and_digits_reach_links() {
+        let mut app = App::new(ORIGIN, None);
+        let (k, r) = fetch_of(&app.start());
+        let mut wiki = course("10", "GPU Computing");
+        wiki.default_view = Some("wiki".into());
+        deliver(&mut app, k, r, Payload::Courses(vec![wiki]));
+        let effects = app.update(key(KeyCode::Enter));
+        let home = ResourceKey::WikiPage("10".into(), crate::modules::FRONT_PAGE.into());
+        assert_eq!(fetches(&effects), [home.clone(), tabs_key()]);
+        answer(
+            &mut app,
+            tabs_key(),
+            Payload::Tabs(vec![tab("home"), tab("announcements")]),
+        );
+        assert_eq!(
+            app.course_tabs("10"),
+            [CourseTab::Home, CourseTab::Announcements]
+        );
+        answer(
+            &mut app,
+            home.clone(),
+            Payload::WikiPage(Box::new(crate::modules::WikiPage {
+                title: Some("Welcome".into()),
+                body: Some(r#"<a href="/courses/10/pages/week-1">Week 1</a>"#.into()),
+                ..Default::default()
+            })),
+        );
+        let scopes = app.scopes();
+        assert!(scopes.contains(&Scope::CourseTabs) && !scopes.contains(&Scope::Sections));
+        assert_eq!(app.browser_url().unwrap(), format!("{ORIGIN}/courses/10"));
+        // Digits reach the links; Enter opens a linked page in the reader.
+        app.update(key(KeyCode::Char('1')));
+        let effects = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            fetch_of(&effects).0,
+            ResourceKey::WikiPage("10".into(), "week-1".into())
+        );
+        // On that page Tab moves between sections again.
+        assert!(app.scopes().contains(&Scope::Sections));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.view().kind.tab(), Some((CourseTab::Home, ..))));
+        app.update(key(KeyCode::Esc)); // leave the links section
+        let effects = app.update(key(KeyCode::Tab));
+        assert_eq!(
+            fetch_of(&effects).0,
+            ResourceKey::Announcements("10".into())
+        );
+        app.update(key(KeyCode::Tab));
+        assert!(matches!(app.view().kind.tab(), Some((CourseTab::Home, ..))));
     }
 }

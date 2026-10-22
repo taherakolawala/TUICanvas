@@ -269,6 +269,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         draw_announcements(frame, body, app, &course_id, now)
                     }
                     CourseTab::Modules => draw_modules(frame, body, app, &course_id, now),
+                    CourseTab::Home => {} // a page, drawn below
                 }
             }
             ViewKind::CourseHome { course_id, .. } => {
@@ -288,8 +289,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ViewKind::Announcement { course_name, .. }
             | ViewKind::Detail { course_name, .. }
             | ViewKind::WikiPage { course_name, .. } => {
-                let page = app.view().kind.page().expect("a page view");
-                draw_page(frame, main, app, &page, &course_name, now)
+                let kind = app.view().kind.clone();
+                let page = kind.page().expect("a page view");
+                // A course's Home is one of its tabs: show the tab bar above it.
+                let area = match kind.tab() {
+                    Some((tab, course_id, _)) => {
+                        let [tabs, body] =
+                            Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
+                                .areas(main);
+                        draw_tabs(frame, tabs, &app.course_tabs(course_id), Some(tab));
+                        body
+                    }
+                    None => main,
+                };
+                draw_page(frame, area, app, &page, &course_name, now)
             }
         }
     }
