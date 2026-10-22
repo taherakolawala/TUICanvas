@@ -334,3 +334,9 @@ Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke`
 | `tuicanvas --bench N` | Runs start → course list → course → assignment → back N times, cold and warm, on an in-memory screen (or `--terminal` for a real console). Uses a private snapshot folder. Writes `benchmarks/private/tui-bench*.json`. |
 | `tools/browser_bench.py` | The same workflow on the Canvas website in headless Edge with the saved session. Content-visible time is taken from the page's own clock; requests and transferred bytes are counted with DevTools Protocol events. Writes `benchmarks/private/browser-bench.json`. |
 | `scripts/check.ps1`, `scripts/watch.ps1` | Build, test, live checks and git tasks on Windows, on request |
+
+## Announcements
+
+`announcements.rs` owns the typed list/detail models and request policy. It fetches the selected course's metadata using paginated GraphQL, then sorts by posting time (delayed/creation dates as fallbacks); a single REST read loads an opened announcement's body and attachments. A schema rejection permits the REST list fallback, while network/auth/pagination failures remain visible.
+
+The tab and detail use distinct `ResourceKey` variants, so snapshots, request generations, Syncing/Outdated states and rendering caches stay separate from assignments. Only visible list rows are rendered, and message HTML is wrapped once per version and width. Links share the existing Canvas file library and assignment navigation; file metadata and downloads are requested only when a file is chosen. Announcement read status combines Canvas state with account-scoped local reading history. Opening a readable detail records its course/topic ID separately from snapshots; fresh server responses cannot erase this local Read indicator. No read-status writes are sent to Canvas.

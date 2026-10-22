@@ -15,10 +15,11 @@ Mon Oct 5 11:59 PM   Lab-1 Assignment                 Graded 9/10        10 pts
 
 Current progress, known issues and next steps: [docs/status.md](docs/status.md). How it works and which optimizations are in place: [docs/architecture.md](docs/architecture.md). Measured against the Canvas website: [benchmarks/baseline-2026-10-20.md](benchmarks/baseline-2026-10-20.md).
 
-It covers sign in (GatorLink + Duo) → course list → assignment list → assignment details (deadline, submission status, description), and course files.
+It covers sign in (GatorLink + Duo) → course list → assignment list → assignment details (deadline, submission status, description), course files, and announcements.
 
 - Every screen shows a saved copy right away, with **Syncing…** at the top while it fetches fresh data. If the fetch fails, the screen says **Outdated** instead of pretending the old copy is current.
 - **Files.** Each course has a Files tab that mirrors its Canvas folders, and each assignment lists its attachments and links. Files download into `C:\Users\<you>\TUICanvas\<course>\Class Files` or `Assignment Files\<assignment>` and open in their default app. A file used in both places is stored once.
+- **Announcements.** A per-course tab lists all announcements newest-first, with author, posting date and Canvas read status. Open one to read its message and attachments; replies open in the browser. Opening a readable message marks it Read locally in the TUI, remembered across restarts. Canvas read status is unchanged. Files are fetched only when you choose them and go in `Announcement Files\<announcement-id>`.
 - Submitting work (file upload, text entry) is next; modules, pages and discussions open in the browser for now. Quizzes and assessments are out of scope (see `docs/build-plan.md`).
 
 ## How sign-in works
@@ -63,7 +64,7 @@ tuicanvas --bench [N]     Time the workflow N times -> benchmarks/private/tui-be
 | `↑` `↓` / `j` `k`, PgUp/PgDn, `g` `G` | Move or scroll |
 | `Enter` / `→` | Open (a file opens in its default app, downloading it first if needed) |
 | `Esc` / `←` / Backspace | Back (or clear the filter or selection) |
-| `Tab` | In a course: switch between Assignments and Files. In an assignment: select the next file or link (`1`–`9` jump to one) |
+| `Tab` / `Shift+Tab` | In a course: cycle Assignments, Files and Announcements forward/backward. In an assignment or announcement: select the next/previous file or link (`1`–`9` jump to one) |
 | `d` / `D` | Download the selected file (or folder) / everything here |
 | `e` | Show the file or its folder in File Explorer (on the course list: your TUICanvas folder) |
 | `/` | Filter the current list (in Files: search the whole course) |

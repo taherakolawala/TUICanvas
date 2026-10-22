@@ -11,7 +11,7 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 | 1. Sign-in and request experiment | **Done** | Terminal sign-in (GatorLink + Duo); live-verified native REST and GraphQL reads; failure classification; [request policy](request-policy.md) |
 | 2. Reader vertical slice | **Done** | Courses → assignments → assignment detail, with saved copy + Syncing, refresh, back, filter, open in browser |
 | 3. Rendering and network baseline | **Done** | Network, parse and draw timed separately (`--diag`, `--bench`); automated website baseline; the reader shows fresh data 6–10× sooner than the website ([baseline](../benchmarks/baseline-2026-10-20.md)) |
-| 4. Selective resource reuse | Partly | Saved copies for courses, assignment lists and details only (always re-read on entry) |
+| 4. Selective resource reuse | Partly | Saved copies for courses, assignments, files and announcements (always re-read on entry) |
 | 5. Prediction experiment | Not started | |
 | 6. Hardening and delivery | Not started | |
 | 7. Local file library | **Done** | `%USERPROFILE%\TUICanvas\<course>\Class Files` and `Assignment Files`; one stored copy per file shown in several places through hard links; change detection; safe names; 30-day clean-up of automatic images; downloads restricted to Canvas and its storage hosts. Verified live: download, install, hard link, internet mark. |
@@ -27,7 +27,8 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - The app starts sign-in itself if the saved session has expired at launch. Mid-session expiry shows a banner and waits for `L`.
 - **Reader** (`target\release\tuicanvas.exe`).
   - Shows course list, assignment list (due date, status, points) and assignment detail (deadline, availability, status, attempts, description with links).
-  - **Files.** Each course has Assignments and Files tabs (`Tab`). Files mirrors the course's Canvas folders; `Enter` opens a file in its default app (downloading it first if needed), `d` downloads, `D` downloads a whole folder, `e` shows it in File Explorer, `/` searches every folder. Each file shows whether it is saved, newer on Canvas, downloading or locked.
+  - **Files.** Each course has Assignments, Files and Announcements tabs (`Tab` / `Shift+Tab`). Files mirrors the course's Canvas folders; `Enter` opens a file in its default app (downloading it first if needed), `d` downloads, `D` downloads a whole folder, `e` shows it in File Explorer, `/` searches every folder. Each file shows whether it is saved, newer on Canvas, downloading or locked.
+  - **Announcements.** Per-course list and details, newest posting date first; author/date/Canvas read status, title filter, saved copy + Syncing/Outdated, keyboard links and attachments. Full metadata pagination avoids dropping older-created announcements published recently. Body HTML is fetched only on opening. Files and inline images download only when chosen into `Announcement Files/<id>`. Replies open in the browser; reading marks it Read in the TUI across restarts without mutating Canvas read status.
   - **Assignment files & links.** A numbered list under each description, matching the `[n]` marks in the text. `Tab` or `1`–`9` selects, `Enter` opens (files in their app, other assignments in the reader, anything else in the browser), `d`/`D` download, `e` shows the folder, `o` opens the selected item's page in the browser.
   - Files go to `C:\Users\<you>\TUICanvas` (`e` on the course list opens it). Images in an assignment download when you open it and are removed after 30 days unused.
   - Each screen shows its saved copy at once, with **Syncing** at the top, and is labelled **Outdated** if the fresh read fails.
@@ -43,7 +44,8 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - The reader's own work (parse, update, draw) takes 1–3 ms; the rest is Canvas's response time.
   - All three build-plan performance goals are met.
 - **Downloads**, measured live: a 908 KB PDF in 1.1 s through the full redirect chain, saved, linked and marked as downloaded from the internet.
-- **Checks.** 62 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads, file access and one download; `tuicanvas --dump DIR` renders each screen headlessly, including the Files tab, and downloads one file into a scratch library.
+- **Announcements live check (2026-10-21).** Rust read all 1,380 announcements across 17 courses and opened one detail in each of the 13 nonempty courses. Median list refresh: 237 ms. The 674-item course took 5.43 s across seven pages, 205 KB; cached lists remain visible while refreshing. Counts match the earlier probe; no account content is included in the report.
+- **Checks.** 72 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads, file access and one download; `tuicanvas --dump DIR` renders each screen headlessly, including the Files tab, and downloads one file into a scratch library.
 
 ## Known issues and limits
 
@@ -86,3 +88,5 @@ target\release\tuicanvas.exe --bench 10
 ```
 
 `--smoke` writes `benchmarks/private/smoke.json` (metadata only). `--dump` writes the rendered screens as text. The two benchmarks write `benchmarks/private/tui-bench.json` and `browser-bench.json`.
+
+- **Announcement comment-lock fix (2026-10-21).** `locked_for_user` may mean replies are closed while the message remains readable. Render the server-returned body and use `lock_info.can_view` for links. Regression coverage includes closed-comments bodies/links and replay of private saved responses without logging content. The earlier live check verified response IDs but did not verify body rendering; the render regression now covers that missed case.
