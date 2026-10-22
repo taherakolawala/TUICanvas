@@ -68,6 +68,7 @@ pub enum Payload {
     History(crate::submission::History),
     Files(Box<CourseFilesData>),
     File(Box<CanvasFile>),
+    Planner(Vec<crate::calendar::Item>),
 }
 
 /// A course's Files area as the reader keeps it.
@@ -219,6 +220,8 @@ pub enum Section {
     Text,
     Links,
     Submissions,
+    /// The calendar on the course list.
+    Calendar,
 }
 
 /// The actions menu (`Space`).
@@ -302,6 +305,8 @@ pub struct View {
     pub link: usize,
     /// Selected attempt in an assignment's submissions (0 = latest).
     pub attempt: usize,
+    /// Selected entry of the home-screen calendar.
+    pub event: usize,
     /// Bring the focused section into view on the next draw.
     pub reveal: bool,
 }
@@ -318,6 +323,7 @@ impl View {
             focus: Section::Text,
             link: 0,
             attempt: 0,
+            event: 0,
             reveal: false,
         }
     }
@@ -364,6 +370,8 @@ pub struct App {
     pub origin: String,
     store: Option<Arc<SnapshotStore>>,
     pub courses: Resource<Vec<Course>>,
+    /// The home-screen calendar: due dates and events for the next two weeks.
+    pub planner: Resource<Vec<crate::calendar::Item>>,
     pub announcements: HashMap<String, Resource<Vec<crate::announcements::Summary>>>,
     pub announcement_details: HashMap<(String, String), Resource<crate::announcements::Detail>>,
     pub announcement_render: Option<DetailRender>,
@@ -450,6 +458,7 @@ impl App {
             origin: origin.to_string(),
             store,
             courses: Resource::default(),
+            planner: Resource::default(),
             announcements: HashMap::new(),
             announcement_details: HashMap::new(),
             announcement_render: None,
@@ -501,6 +510,7 @@ impl App {
     fn sync_of(&self, key: &ResourceKey) -> Option<&SyncState> {
         match key {
             ResourceKey::Courses => Some(&self.courses.sync),
+            ResourceKey::Planner => Some(&self.planner.sync),
             ResourceKey::Announcements(c) => self.announcements.get(c).map(|r| &r.sync),
             ResourceKey::Assignments(c) => self.assignments.get(c).map(|r| &r.sync),
             ResourceKey::Announcement(c, a) => self
@@ -529,6 +539,7 @@ impl App {
             }
 
             ResourceKey::Courses => self.courses.sync = sync,
+            ResourceKey::Planner => self.planner.sync = sync,
             ResourceKey::Assignments(c) => {
                 self.assignments.entry(c.clone()).or_default().sync = sync
             }
@@ -560,6 +571,11 @@ impl App {
         self.mark_current_announcement_read();
         self.dirty = true;
         let mut effects: Vec<Effect> = self.request(key, explicit).into_iter().collect();
+        // The calendar is part of the home screen: read it with the course list.
+        if self.view().kind == ViewKind::Courses {
+            self.load_snapshot(&ResourceKey::Planner);
+            effects.extend(self.request(ResourceKey::Planner, explicit));
+        }
         // Past submissions are part of the assignment page: read them with it
         // when the copy on hand shows something was submitted.
         if let ViewKind::Detail {
@@ -603,6 +619,15 @@ impl App {
                     self.courses.version += 1;
                 }
             }
+            ResourceKey::Planner if self.planner.data.is_none() => {
+                if let Some((data, at)) = store.load(key) {
+                    self.planner.data = Some(data);
+                    self.planner.fetched_at = Some(at);
+                    self.planner.origin = Origin::Cache;
+                    self.planner.version += 1;
+                }
+            }
+            ResourceKey::Planner => {}
             ResourceKey::Announcements(c) => {
                 let res = self.announcements.entry(c.clone()).or_default();
                 if res.data.is_none()
@@ -813,6 +838,18 @@ impl App {
                 }
                 let mut effects = Vec::new();
                 match (payload, &key) {
+                    (Payload::Planner(items), ResourceKey::Planner) => {
+                        let r = &mut self.planner;
+                        r.data = Some(items);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
+                        let n = self.calendar_items().len();
+                        for view in &mut self.stack {
+                            view.event = view.event.min(n.saturating_sub(1));
+                        }
+                    }
                     (Payload::Courses(list), ResourceKey::Courses) => {
                         let r = &mut self.courses;
                         r.data = Some(list);
@@ -1672,7 +1709,12 @@ impl App {
             scopes.push(Scope::SignedOut);
         }
         match &view.kind {
-            ViewKind::Courses => scopes.extend([Scope::List, Scope::Courses]),
+            ViewKind::Courses => {
+                scopes.extend([Scope::List, Scope::Courses]);
+                if self.focus() == Section::Calendar {
+                    scopes.push(Scope::Calendar);
+                }
+            }
             ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => {
                 scopes.extend([Scope::List, Scope::CourseTabs])
             }
@@ -1688,7 +1730,7 @@ impl App {
                 match self.focus() {
                     Section::Links => scopes.push(Scope::Links),
                     Section::Submissions => scopes.push(Scope::Submissions),
-                    Section::Text => {}
+                    Section::Text | Section::Calendar => {}
                 }
             }
         }
@@ -1697,6 +1739,13 @@ impl App {
 
     /// Sections the current page has, in order: text, files & links, submissions.
     pub fn sections(&self) -> Vec<Section> {
+        if self.view().kind == ViewKind::Courses {
+            return if self.calendar_items().is_empty() {
+                vec![Section::Text]
+            } else {
+                vec![Section::Text, Section::Calendar]
+            };
+        }
         let Some(page) = self.view().kind.page() else {
             return vec![];
         };
@@ -1799,7 +1848,10 @@ impl App {
                     .is_some_and(|d| d.base.submission_types.iter().any(|t| t == "online_upload")),
                 _ => false,
             },
-            Act::NextSection | Act::PrevSection => page.is_none() || self.sections().len() > 1,
+            Act::NextSection | Act::PrevSection => {
+                (page.is_none() && self.view().kind != ViewKind::Courses)
+                    || self.sections().len() > 1
+            }
             Act::HideCourse => !self.visible_rows().is_empty(),
             Act::Search => self.is_list(),
             _ => true,
@@ -1954,7 +2006,7 @@ impl App {
             Act::Back => self.go_back(),
             Act::NextSection | Act::PrevSection => {
                 let forward = act == Act::NextSection;
-                if page.is_some() {
+                if page.is_some() || self.view().kind == ViewKind::Courses {
                     self.cycle_section(forward);
                     vec![]
                 } else {
@@ -2179,11 +2231,12 @@ impl App {
             Act::Top => isize::MIN / 2,
             _ => isize::MAX / 2,
         };
-        if self.is_list() {
+        if self.is_list() && self.focus() != Section::Calendar {
             self.move_selection(delta);
             return;
         }
         let count = match (self.focus(), self.view().kind.page()) {
+            (Section::Calendar, _) => self.calendar_items().len(),
             (Section::Links, _) => self.current_links().len(),
             (Section::Submissions, Some(Page::Assignment(c, a))) => self.attempt_count(&c, &a),
             _ => 0,
@@ -2196,6 +2249,7 @@ impl App {
             Section::Text => view.scroll = (view.scroll as isize + delta).max(0) as usize,
             Section::Links => view.link = step(view.link),
             Section::Submissions => view.attempt = step(view.attempt),
+            Section::Calendar => view.event = step(view.event),
         }
     }
 
@@ -2241,7 +2295,9 @@ impl App {
             v.selected = 0;
             return vec![];
         }
-        if self.view().kind.page().is_some() && self.view().focus != Section::Text {
+        if (self.view().kind.page().is_some() || self.view().kind == ViewKind::Courses)
+            && self.view().focus != Section::Text
+        {
             self.view_mut().focus = Section::Text;
             return vec![];
         }
@@ -2270,10 +2326,81 @@ impl App {
         self.enter_current(false)
     }
 
+    /// Short label for a course: its code, else its name.
+    pub fn course_code(&self, course_id: &str) -> String {
+        self.courses
+            .data
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|c| c.id == course_id)
+            .map(|c| {
+                c.course_code
+                    .clone()
+                    .unwrap_or_else(|| c.title().to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The calendar's entries, in date order, without hidden courses.
+    pub fn calendar_items(&self) -> Vec<crate::calendar::Item> {
+        self.planner
+            .data
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|i| i.listed())
+            .filter(|i| {
+                self.show_hidden
+                    || i.course_id
+                        .as_ref()
+                        .is_none_or(|c| !self.hidden_courses.contains(c))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The Canvas page of a calendar entry, kept on the Canvas origin.
+    fn calendar_url(&self, item: &crate::calendar::Item) -> String {
+        match item.url.as_deref() {
+            Some(path) if path.starts_with('/') && !path.starts_with("//") => {
+                format!("{}{path}", self.origin)
+            }
+            Some(url) if url.starts_with(&format!("{}/", self.origin)) => url.to_string(),
+            _ => match &item.course_id {
+                Some(c) => format!("{}/courses/{c}", self.origin),
+                None => format!("{}/calendar", self.origin),
+            },
+        }
+    }
+
+    /// `Enter` on the calendar: assignments open in the reader, anything else in the browser.
+    fn open_calendar_item(&mut self) -> Vec<Effect> {
+        let Some(item) = self.calendar_items().into_iter().nth(self.view().event) else {
+            return vec![];
+        };
+        if item.kind == crate::calendar::Kind::Assignment
+            && let Some(course_id) = item.course_id.clone()
+        {
+            let course_name = self.course_title(&course_id);
+            self.stack.push(View::new(ViewKind::Detail {
+                course_id,
+                course_name,
+                assignment_id: item.id.clone(),
+                title: item.title.clone(),
+            }));
+            return self.enter_current(false);
+        }
+        vec![Effect::OpenUrl(self.calendar_url(&item))]
+    }
+
     /// `r`: read this screen again now (and an assignment's past submissions).
     fn refresh(&mut self) -> Vec<Effect> {
         let key = self.view().key();
         let mut effects: Vec<Effect> = self.request(key, true).into_iter().collect();
+        if self.view().kind == ViewKind::Courses {
+            effects.extend(self.request(ResourceKey::Planner, true));
+        }
         if let ViewKind::Detail {
             course_id,
             assignment_id,
@@ -2636,6 +2763,9 @@ impl App {
     }
 
     fn open_selected(&mut self) -> Vec<Effect> {
+        if self.focus() == Section::Calendar {
+            return self.open_calendar_item();
+        }
         let rows = self.visible_rows();
         let Some(&index) = rows.get(self.view().selected) else {
             return vec![];
@@ -2796,6 +2926,10 @@ impl App {
                 } else {
                     format!("{base}/folder/{}", parts.join("/"))
                 })
+            }
+            ViewKind::Courses if self.focus() == Section::Calendar => {
+                let item = self.calendar_items().into_iter().nth(self.view().event)?;
+                Some(self.calendar_url(&item))
             }
             ViewKind::Courses => {
                 let rows = self.visible_rows();

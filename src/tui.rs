@@ -94,6 +94,9 @@ impl Executor {
                 ResourceKey::Announcement(c, a) => crate::announcements::detail(&client, c, a)
                     .await
                     .map(|(v, s)| (Payload::Announcement(Box::new(v)), s)),
+                ResourceKey::Planner => crate::calendar::read(&client)
+                    .await
+                    .map(|(v, s)| (Payload::Planner(v), s)),
                 ResourceKey::Courses => api::courses(&client)
                     .await
                     .map(|(v, s)| (Payload::Courses(v), s)),
@@ -123,6 +126,7 @@ impl Executor {
                     Payload::Announcements(v) => store.save(&key, v, at),
                     Payload::Announcement(v) => store.save(&key, v.as_ref(), at),
                     Payload::Courses(v) => store.save(&key, v, at),
+                    Payload::Planner(v) => store.save(&key, v, at),
                     Payload::Assignments(v) => store.save(&key, v, at),
                     Payload::Detail(v) => store.save(&key, v.as_ref(), at),
                     Payload::History(_) => {}

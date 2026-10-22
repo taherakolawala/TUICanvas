@@ -102,6 +102,8 @@ pub enum Scope {
     Links,
     /// The past submissions section has focus.
     Submissions,
+    /// The calendar on the course list has focus.
+    Calendar,
     Assignment,
     SignedOut,
     /// Typing in a list's search box.
@@ -230,6 +232,22 @@ pub static BINDINGS: &[Binding] = &[
         .title("Older attempt")
         .hint(1)
         .shown("↑↓"),
+    b(Act::Up, &[UP, ch('k')], &[Calendar], "select").title("Earlier entry"),
+    b(Act::Down, &[DOWN, ch('j')], &[Calendar], "select")
+        .title("Later entry")
+        .hint(1)
+        .shown("↑↓"),
+    b(Act::Open, &[ENTER, RIGHT, ch('l')], &[Calendar], "open")
+        .title("Open the entry (assignments here, the rest in the browser)")
+        .hint(2),
+    b(
+        Act::Back,
+        &[ESC, LEFT, ch('h'), BACKSPACE],
+        &[Calendar],
+        "courses",
+    )
+    .title("Back to the course list")
+    .hint(7),
     b(Act::Up, &[UP, ch('k')], &[List, Page, Help], "move").title("Move up"),
     b(Act::Down, &[DOWN, ch('j')], &[List], "move")
         .title("Move down")
@@ -284,6 +302,11 @@ pub static BINDINGS: &[Binding] = &[
         .title("Next tab")
         .hint(6),
     b(Act::PrevSection, &[BACKTAB], &[CourseTabs], "previous tab").title("Previous tab"),
+    b(Act::NextSection, &[TAB], &[Courses], "calendar")
+        .title("Switch between the courses and the calendar")
+        .hint(6),
+    b(Act::PrevSection, &[BACKTAB], &[Courses], "calendar")
+        .title("Switch between the courses and the calendar"),
     b(Act::NextSection, &[TAB], &[Page], "next section")
         .title("Next section (text, files & links, submissions)")
         .hint(5),
@@ -574,6 +597,7 @@ mod tests {
     pub fn contexts() -> Vec<Vec<Scope>> {
         let mut out = vec![
             vec![Screen, List, Courses],
+            vec![Screen, List, Courses, Calendar],
             vec![Screen, List, CourseTabs],
             vec![Screen, List, CourseTabs, Files],
             vec![Screen, Page],

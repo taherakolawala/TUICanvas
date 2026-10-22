@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod bench;
 mod cache;
+mod calendar;
 mod canvas;
 mod config;
 mod diag;

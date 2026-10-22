@@ -252,7 +252,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_submission(frame, main, app, now);
     } else {
         match app.view().kind.clone() {
-            ViewKind::Courses => draw_courses(frame, main, app),
+            ViewKind::Courses => draw_home(frame, main, app, now),
             ViewKind::Assignments { course_id, .. } => {
                 let [tabs, body] =
                     Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
@@ -582,6 +582,172 @@ fn window(app: &mut App, rows: usize, height: usize) -> (usize, usize) {
     }
     view.offset = view.offset.min(rows.saturating_sub(height));
     (view.offset, (view.offset + height).min(rows))
+}
+
+/// The home screen: the course list, with the calendar beside it (wide
+/// terminals) or below it.
+fn draw_home(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) {
+    let entries = app.calendar_items().len();
+    if area.width >= 100 {
+        let [list, gap, calendar] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(46),
+        ])
+        .areas(area);
+        draw_courses(frame, list, app);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled("│", theme::faint());
+                usize::from(gap.height)
+            ]),
+            gap,
+        );
+        draw_calendar(frame, calendar, app, now);
+    } else if area.height >= 16 {
+        let days = app
+            .calendar_items()
+            .iter()
+            .filter_map(|i| i.day())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let wanted = (entries + days + 1).max(2) as u16;
+        let [list, calendar] = Layout::vertical([
+            Constraint::Min(5),
+            Constraint::Length(wanted.min(area.height / 2)),
+        ])
+        .areas(area);
+        draw_courses(frame, list, app);
+        draw_calendar(frame, calendar, app, now);
+    } else {
+        draw_courses(frame, area, app);
+    }
+}
+
+/// Upcoming deadlines and events, grouped by day. `Tab` gives it focus.
+fn draw_calendar(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) {
+    use crate::calendar::{self, Kind, Progress};
+    let focused = app.focus() == Section::Calendar;
+    let width = usize::from(area.width);
+    let items = app.calendar_items();
+    let mut lines: Vec<Line> = vec![section_heading(
+        format!("Upcoming · {} days", calendar::DAYS),
+        focused,
+        width.saturating_sub(1),
+    )];
+    if items.is_empty() {
+        let (text, style) = match (&app.planner.data, &app.planner.sync) {
+            (None, SyncState::Failed(e)) => (
+                format!("Calendar unavailable: {}", e.describe()),
+                theme::error(),
+            ),
+            (None, _) => ("Loading calendar…".to_string(), theme::muted()),
+            _ => (
+                format!("Nothing due in the next {} days.", calendar::DAYS),
+                theme::muted(),
+            ),
+        };
+        lines.push(Line::styled(text, style));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let today = now.with_timezone(&Local).date_naive();
+    let selected = app.view().event.min(items.len() - 1);
+    let one_line = width >= 70;
+    let mut selected_row = 0;
+    let mut day = None;
+    for (i, item) in items.iter().enumerate() {
+        if item.day() != day {
+            day = item.day();
+            if let Some(d) = day {
+                lines.push(Line::styled(calendar::day_label(d, today), theme::accent()));
+            }
+        }
+        let finished = item.progress.finished();
+        let time = item
+            .at
+            .map(|t| t.with_timezone(&Local).format("%-I:%M %p").to_string())
+            .unwrap_or_default();
+        let time_style = theme::due(item.at, finished || item.kind == Kind::Event, now);
+        let course = item
+            .course_id
+            .as_ref()
+            .map(|c| app.course_code(c))
+            .filter(|c| !c.is_empty())
+            .or_else(|| item.course.clone())
+            .unwrap_or_default();
+        let mut tags = Vec::new();
+        if item.kind != Kind::Assignment {
+            tags.push(item.kind.label().to_string());
+        }
+        if item.progress != Progress::Open {
+            tags.push(item.progress.label().to_string());
+        }
+        let tag_style = match item.progress {
+            Progress::Missing => theme::error(),
+            p if p.finished() => theme::tone(crate::model::Tone::Good),
+            _ => theme::muted(),
+        };
+        let title_style = if finished {
+            theme::muted()
+        } else {
+            theme::text()
+        };
+        let tag = tags.join(" · ");
+        let mut first = vec![Span::styled(format!(" {time:>8}  "), time_style)];
+        let row = if one_line {
+            let code = truncate(&html::sanitize(&course), 12);
+            let room = width.saturating_sub(12 + code.width() + 2 + tag.width() + 2);
+            first.push(Span::styled(format!("{code}  "), theme::code()));
+            first.push(Span::styled(
+                pad(&html::sanitize(&item.title), room),
+                title_style,
+            ));
+            first.push(Span::styled(format!("  {tag}"), tag_style));
+            vec![Line::from(first)]
+        } else {
+            let room = width.saturating_sub(12);
+            first.push(Span::styled(
+                pad(&html::sanitize(&item.title), room),
+                title_style,
+            ));
+            let mut second = vec![
+                Span::raw(" ".repeat(11)),
+                Span::styled(
+                    truncate(
+                        &html::sanitize(&course),
+                        room.saturating_sub(tag.width() + 3),
+                    ),
+                    theme::code(),
+                ),
+            ];
+            if !tag.is_empty() {
+                second.push(Span::styled(format!(" · {tag}"), tag_style));
+            }
+            vec![Line::from(first), Line::from(second)]
+        };
+        if i == selected {
+            selected_row = lines.len();
+        }
+        for mut line in row {
+            if focused && i == selected {
+                line = line.style(theme::selected());
+            }
+            lines.push(line);
+        }
+    }
+    let height = usize::from(area.height);
+    let skip = if focused {
+        (selected_row + 3)
+            .saturating_sub(height)
+            .min(lines.len().saturating_sub(height))
+    } else {
+        0
+    };
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
+        area,
+    );
 }
 
 fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1726,7 +1892,7 @@ fn draw_page(
         let start = match focus {
             Section::Links => anchors.links,
             Section::Submissions => anchors.submissions,
-            Section::Text => None,
+            Section::Text | Section::Calendar => None,
         };
         if let Some(start) = start {
             view.scroll = start;
@@ -1750,7 +1916,7 @@ fn draw_page(
                 view.scroll = row.saturating_sub(1);
             }
         }
-        Section::Text => {}
+        Section::Text | Section::Calendar => {}
     }
     view.scroll = view.scroll.min(max_scroll);
     let scroll = view.scroll;
@@ -2114,13 +2280,14 @@ mod tests {
             "{narrowed}"
         );
         let effects = send(&mut app, KeyCode::Enter);
-        assert!(matches!(
-            &effects[..],
-            [crate::app::Effect::Fetch {
-                key: ResourceKey::Courses,
-                ..
-            }]
-        ));
+        let keys: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                crate::app::Effect::Fetch { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![ResourceKey::Courses, ResourceKey::Planner]);
         assert!(app.menu.is_none());
         // `?` lists the keys of this screen and the menu-only actions.
         send(&mut app, KeyCode::Char('?'));
@@ -2143,6 +2310,113 @@ mod tests {
                 .contains("Space actions  ? help"),
             "{footer}"
         );
+    }
+
+    #[test]
+    fn home_screen_shows_the_calendar_and_tab_focuses_it() {
+        use crate::calendar::{Item, Kind, Progress};
+        let now = Utc::now();
+        let mut app = App::new("https://ufl.instructure.com", None);
+        let effects = app.start();
+        let keys: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                crate::app::Effect::Fetch { key, request } => Some((key.clone(), *request)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "courses and calendar are read together");
+        let (planner_key, planner_request) = keys[1].clone();
+        assert_eq!(planner_key, ResourceKey::Planner);
+        deliver(
+            &mut app,
+            vec![crate::app::Effect::Fetch {
+                key: keys[0].0.clone(),
+                request: keys[0].1,
+            }],
+            Payload::Courses(vec![Course {
+                id: "10".into(),
+                name: Some("GPU Computing".into()),
+                course_code: Some("EEL5934".into()),
+                ..Default::default()
+            }]),
+        );
+        let item = |id: &str, kind, title: &str, hours: i64, progress| Item {
+            kind,
+            id: id.into(),
+            course_id: Some("10".into()),
+            course: Some("GPU Computing".into()),
+            title: title.into(),
+            at: Some(now + chrono::Duration::hours(hours)),
+            points: None,
+            url: Some(format!("/courses/10/assignments/{id}")),
+            progress,
+        };
+        deliver(
+            &mut app,
+            vec![crate::app::Effect::Fetch {
+                key: planner_key,
+                request: planner_request,
+            }],
+            Payload::Planner(vec![
+                item(
+                    "7",
+                    Kind::Assignment,
+                    "Lab-3 Assignment",
+                    30,
+                    Progress::Open,
+                ),
+                item("8", Kind::Quiz, "Quiz 4", 54, Progress::Missing),
+                item("9", Kind::Announcement, "News", 2, Progress::Open),
+            ]),
+        );
+        let wide = screen(&mut app, 120, 14);
+        println!("{wide}\n");
+        assert!(
+            wide.contains("Upcoming · 14 days")
+                && wide.contains("Lab-3 Assignment")
+                && wide.contains("missing"),
+            "{wide}"
+        );
+        assert!(
+            !wide.contains("News"),
+            "announcements are not calendar entries"
+        );
+        let narrow = screen(&mut app, 80, 20);
+        println!("{narrow}\n");
+        assert!(
+            narrow.contains("Quiz 4") && narrow.contains("EEL5934"),
+            "{narrow}"
+        );
+        // Tab moves to the calendar; Enter on an assignment opens it here.
+        let send = |app: &mut App, code: KeyCode| {
+            app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        };
+        send(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), Section::Calendar);
+        assert!(
+            screen(&mut app, 120, 14)
+                .lines()
+                .last()
+                .unwrap()
+                .contains("Tab calendar")
+        );
+        let effects = send(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&effects[..], [crate::app::Effect::Fetch { key: ResourceKey::Detail(c, a), .. }] if c == "10" && a == "7"),
+            "{effects:?}"
+        );
+        send(&mut app, KeyCode::Esc);
+        // Anything else opens in the browser.
+        send(&mut app, KeyCode::Down);
+        assert_eq!(
+            send(&mut app, KeyCode::Enter),
+            vec![crate::app::Effect::OpenUrl(
+                "https://ufl.instructure.com/courses/10/assignments/8".into()
+            )]
+        );
+        send(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Section::Text);
     }
 
     /// Replays private saved responses without printing announcement contents.
