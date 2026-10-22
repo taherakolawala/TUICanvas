@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ResourceKey {
     Courses,
-    /// The home-screen calendar (planner items for the next two weeks).
-    Planner,
+    /// One month of the home-screen calendar (`2026-10`).
+    Planner(String),
+    /// The student's course colours.
+    Colors,
     Assignments(String),
     Detail(String, String),
     /// Loaded on demand; kept only in memory because attempts may contain work.
@@ -29,7 +31,10 @@ impl ResourceKey {
         let ok = |id: &str| crate::model::valid_id(id);
         let name = match self {
             ResourceKey::Courses => "courses".to_string(),
-            ResourceKey::Planner => "planner".to_string(),
+            ResourceKey::Planner(m) if crate::calendar::month_of(m).is_some() && m.len() == 7 => {
+                format!("planner-{m}")
+            }
+            ResourceKey::Colors => "colors".to_string(),
             ResourceKey::Announcements(c) if ok(c) => {
                 format!("announcements-{}", c.replace('~', "_"))
             }
@@ -53,7 +58,8 @@ impl ResourceKey {
     pub fn label(&self) -> &'static str {
         match self {
             ResourceKey::Courses => "courses",
-            ResourceKey::Planner => "calendar",
+            ResourceKey::Planner(_) => "calendar",
+            ResourceKey::Colors => "colors",
             ResourceKey::Announcements(_) => "announcements",
             ResourceKey::Announcement(..) => "announcement",
             ResourceKey::Assignments(_) => "assignments",

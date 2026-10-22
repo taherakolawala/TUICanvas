@@ -39,6 +39,10 @@ fn badge(fg_color: Color, bg_color: Color) -> Style {
     }
 }
 
+/// Foreground colour (course colours), or plain under NO_COLOR.
+pub fn color(c: Color) -> Style {
+    fg(c)
+}
 pub fn text() -> Style {
     Style::new()
 }

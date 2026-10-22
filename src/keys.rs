@@ -17,6 +17,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Act {
     Up,
     Down,
+    Left,
+    Right,
     PageUp,
     PageDown,
     Top,
@@ -49,9 +51,11 @@ pub enum Act {
 
 impl Act {
     #[cfg(test)]
-    pub const ALL: [Act; 30] = [
+    pub const ALL: [Act; 32] = [
         Act::Up,
         Act::Down,
+        Act::Left,
+        Act::Right,
         Act::PageUp,
         Act::PageDown,
         Act::Top,
@@ -102,8 +106,10 @@ pub enum Scope {
     Links,
     /// The past submissions section has focus.
     Submissions,
-    /// The calendar on the course list has focus.
+    /// The month grid on the course list has focus.
     Calendar,
+    /// The selected day's entries have focus.
+    Day,
     Assignment,
     SignedOut,
     /// Typing in a list's search box.
@@ -232,21 +238,43 @@ pub static BINDINGS: &[Binding] = &[
         .title("Older attempt")
         .hint(1)
         .shown("↑↓"),
-    b(Act::Up, &[UP, ch('k')], &[Calendar], "select").title("Earlier entry"),
-    b(Act::Down, &[DOWN, ch('j')], &[Calendar], "select")
-        .title("Later entry")
+    b(Act::Left, &[LEFT, ch('h')], &[Calendar], "day").title("Previous day"),
+    b(Act::Right, &[RIGHT, ch('l')], &[Calendar], "day")
+        .title("Next day")
+        .hint(1)
+        .shown("←→↑↓"),
+    b(Act::Up, &[UP, ch('k')], &[Calendar], "week").title("Previous week"),
+    b(Act::Down, &[DOWN, ch('j')], &[Calendar], "week").title("Next week"),
+    b(Act::PageUp, &[PGUP], &[Calendar], "month").title("Previous month"),
+    b(Act::PageDown, &[PGDN], &[Calendar], "month")
+        .title("Next month")
+        .hint(3)
+        .shown("PgUp/PgDn"),
+    b(Act::Top, &[HOME, ch('g')], &[Calendar], "today")
+        .title("Go to today")
+        .hint(4)
+        .shown("Home"),
+    b(Act::Open, &[ENTER], &[Calendar], "open")
+        .title("Open the day's entry, or choose one when there are several")
+        .hint(2),
+    b(Act::Back, &[ESC, BACKSPACE], &[Calendar], "courses")
+        .title("Back to the course list")
+        .hint(7),
+    b(Act::Up, &[UP, ch('k')], &[Day], "select").title("Previous entry"),
+    b(Act::Down, &[DOWN, ch('j')], &[Day], "select")
+        .title("Next entry")
         .hint(1)
         .shown("↑↓"),
-    b(Act::Open, &[ENTER, RIGHT, ch('l')], &[Calendar], "open")
+    b(Act::Open, &[ENTER, RIGHT, ch('l')], &[Day], "open")
         .title("Open the entry (assignments here, the rest in the browser)")
         .hint(2),
     b(
         Act::Back,
         &[ESC, LEFT, ch('h'), BACKSPACE],
-        &[Calendar],
-        "courses",
+        &[Day],
+        "calendar",
     )
-    .title("Back to the course list")
+    .title("Back to the calendar")
     .hint(7),
     b(Act::Up, &[UP, ch('k')], &[List, Page, Help], "move").title("Move up"),
     b(Act::Down, &[DOWN, ch('j')], &[List], "move")
@@ -286,14 +314,10 @@ pub static BINDINGS: &[Binding] = &[
     )
     .title("Back to the text")
     .hint(7),
-    b(
-        Act::Back,
-        &[ESC, LEFT, ch('h'), BACKSPACE],
-        &[Screen],
-        "back",
-    )
-    .title("Go back")
-    .hint(8),
+    b(Act::Back, &[ESC, BACKSPACE], &[Screen], "back")
+        .title("Go back")
+        .hint(8),
+    b(Act::Back, &[LEFT, ch('h')], &[List, Page], "back").title("Go back"),
     b(Act::Back, &[ESC], &[Menu, Help], "close")
         .title("Close")
         .hint(2),
@@ -597,7 +621,8 @@ mod tests {
     pub fn contexts() -> Vec<Vec<Scope>> {
         let mut out = vec![
             vec![Screen, List, Courses],
-            vec![Screen, List, Courses, Calendar],
+            vec![Screen, Courses, Calendar],
+            vec![Screen, Courses, Day],
             vec![Screen, List, CourseTabs],
             vec![Screen, List, CourseTabs, Files],
             vec![Screen, Page],

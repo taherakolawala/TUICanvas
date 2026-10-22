@@ -1,18 +1,15 @@
-//! The home-screen calendar: what is due and scheduled in the next two weeks
-//! across all courses, from Canvas's planner in one read.
+//! The home-screen calendar: a month grid of what is due and scheduled across
+//! all courses, from Canvas's planner in one read per month shown.
 //!
 //! Measured on 17 courses (2026-10-22): `GET /api/v1/planner/items` for 14
 //! days returned 3 items in one request (2.7 KB, about 0.8 s), with each
 //! item's course and the student's submission state. The calendar-events
 //! read needs one request per 10 courses and has no submission state.
 
-use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::{CanvasClient, CanvasError, FetchStats};
-
-/// How far ahead the calendar looks.
-pub const DAYS: i64 = 14;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -211,34 +208,103 @@ impl RawItem {
     }
 }
 
-/// From the start of today (local time) to `DAYS` days later.
-pub fn window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let today = now.with_timezone(&Local).date_naive();
-    let start = Local
-        .from_local_datetime(&today.and_hms_opt(0, 0, 0).expect("midnight"))
+/// `2026-10` for a day in October 2026: the key of that month's read.
+pub fn month_key(day: NaiveDate) -> String {
+    day.format("%Y-%m").to_string()
+}
+
+pub fn month_of(key: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(&format!("{key}-01"), "%Y-%m-%d").ok()
+}
+
+/// The month grid around `day`: its first shown day (a Sunday on or before
+/// the 1st) and how many weeks it spans (to the Saturday on or after the last day).
+pub fn grid(day: NaiveDate) -> (NaiveDate, usize) {
+    let first = day.with_day(1).expect("day 1 exists");
+    let start = first - Duration::days(i64::from(first.weekday().num_days_from_sunday()));
+    let next_month = if first.month() == 12 {
+        NaiveDate::from_ymd_opt(first.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(first.year(), first.month() + 1, 1)
+    }
+    .expect("next month exists");
+    let last = next_month - Duration::days(1);
+    let end = last + Duration::days(i64::from(6 - last.weekday().num_days_from_sunday()));
+    (start, ((end - start).num_days() as usize + 1) / 7)
+}
+
+/// The same day number in another month, clamped to that month's length.
+pub fn shift_month(day: NaiveDate, months: i32) -> NaiveDate {
+    let total = day.year() * 12 + day.month0() as i32 + months;
+    let (year, month0) = (total.div_euclid(12), total.rem_euclid(12) as u32);
+    (1..=day.day())
+        .rev()
+        .find_map(|d| NaiveDate::from_ymd_opt(year, month0 + 1, d))
+        .unwrap_or(day)
+}
+
+fn local_midnight(day: NaiveDate) -> DateTime<Utc> {
+    Local
+        .from_local_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight"))
         .earliest()
         .map(|t| t.with_timezone(&Utc))
-        .unwrap_or(now);
-    (start, start + Duration::days(DAYS))
+        .unwrap_or_else(|| Utc.from_utc_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight")))
 }
 
-pub fn planner_path(now: DateTime<Utc>) -> String {
-    let (start, end) = window(now);
+/// The planner read covering the whole grid of `month` (`2026-10`).
+pub fn planner_path(month: &str) -> Option<String> {
+    let (start, weeks) = grid(month_of(month)?);
+    let end = start + Duration::days(7 * weeks as i64);
     let fmt = |t: DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    format!(
+    Some(format!(
         "/api/v1/planner/items?start_date={}&end_date={}&per_page=100",
-        fmt(start),
-        fmt(end)
-    )
+        fmt(local_midnight(start)),
+        fmt(local_midnight(end))
+    ))
 }
 
-/// Everything in the window, in date order.
-pub async fn read(client: &CanvasClient) -> Result<(Vec<Item>, FetchStats), CanvasError> {
-    let (raw, stats): (Vec<RawItem>, _) =
-        client.get_all_pages(&planner_path(Utc::now()), 5).await?;
+/// Everything on the month's grid, in date order.
+pub async fn read(
+    client: &CanvasClient,
+    month: &str,
+) -> Result<(Vec<Item>, FetchStats), CanvasError> {
+    let path = planner_path(month).ok_or(CanvasError::Invalid("invalid month"))?;
+    let (raw, stats): (Vec<RawItem>, _) = client.get_all_pages(&path, 10).await?;
     let mut items: Vec<Item> = raw.into_iter().filter_map(RawItem::into_item).collect();
     items.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.title.cmp(&b.title)));
     Ok((items, stats))
+}
+
+#[derive(Deserialize)]
+struct RawColors {
+    #[serde(default)]
+    custom_colors: std::collections::HashMap<String, String>,
+}
+
+/// The colours the student picked for courses in Canvas, by course id.
+pub async fn read_colors(
+    client: &CanvasClient,
+) -> Result<(std::collections::HashMap<String, String>, FetchStats), CanvasError> {
+    let (raw, stats): (RawColors, _) = client.get_json("/api/v1/users/self/colors").await?;
+    let colors = raw
+        .custom_colors
+        .into_iter()
+        .filter_map(|(context, color)| {
+            let id = context.strip_prefix("course_")?.to_string();
+            (crate::model::valid_id(&id) && parse_hex(&color).is_some()).then_some((id, color))
+        })
+        .collect();
+    Ok((colors, stats))
+}
+
+/// `#1a2b3c` -> (26, 43, 60).
+pub fn parse_hex(color: &str) -> Option<(u8, u8, u8)> {
+    let hex = color.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let part = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some((part(0)?, part(2)?, part(4)?))
 }
 
 /// "Today", "Tomorrow", or "Fri Oct 24".
@@ -296,16 +362,34 @@ mod tests {
     }
 
     #[test]
-    fn window_starts_at_local_midnight_and_spans_two_weeks() {
-        let now = Utc::now();
-        let (start, end) = window(now);
-        assert!(start <= now && now - start < Duration::hours(25));
-        assert_eq!(end - start, Duration::days(DAYS));
-        let path = planner_path(now);
-        assert!(
-            path.starts_with("/api/v1/planner/items?start_date=")
-                && path.chars().all(|c| c.is_ascii_graphic())
+    fn month_grids_start_on_sunday_and_cover_whole_weeks() {
+        let oct = NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        let (start, weeks) = grid(oct);
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 9, 27).unwrap());
+        assert_eq!(weeks, 5);
+        let (start, weeks) = grid(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        assert_eq!(
+            (start, weeks),
+            (NaiveDate::from_ymd_opt(2026, 7, 26).unwrap(), 6)
         );
+        assert_eq!(month_key(oct), "2026-10");
+        assert_eq!(
+            shift_month(NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(), 1),
+            NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+        assert_eq!(
+            shift_month(oct, -10),
+            NaiveDate::from_ymd_opt(2025, 12, 22).unwrap()
+        );
+        let path = planner_path("2026-10").unwrap();
+        assert!(
+            path.starts_with("/api/v1/planner/items?start_date=2026-09-2")
+                && path.chars().all(|c| c.is_ascii_graphic()),
+            "{path}"
+        );
+        assert!(planner_path("../x").is_none());
+        assert_eq!(parse_hex("#FA4616"), Some((250, 70, 22)));
+        assert_eq!(parse_hex("red"), None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Rendering. Only visible rows are built; description text is wrapped once
 //! per assignment version and width, and styled only for the visible lines.
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -584,170 +584,270 @@ fn window(app: &mut App, rows: usize, height: usize) -> (usize, usize) {
     (view.offset, (view.offset + height).min(rows))
 }
 
-/// The home screen: the course list, with the calendar beside it (wide
-/// terminals) or below it.
+/// The home screen: the course list across the top, a month calendar below.
 fn draw_home(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) {
-    let entries = app.calendar_items().len();
-    if area.width >= 100 {
-        let [list, gap, calendar] = Layout::horizontal([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Length(46),
-        ])
-        .areas(area);
-        draw_courses(frame, list, app);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled("│", theme::faint());
-                usize::from(gap.height)
-            ]),
-            gap,
-        );
-        draw_calendar(frame, calendar, app, now);
-    } else if area.height >= 16 {
-        let days = app
-            .calendar_items()
-            .iter()
-            .filter_map(|i| i.day())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let wanted = (entries + days + 1).max(2) as u16;
-        let [list, calendar] = Layout::vertical([
-            Constraint::Min(5),
-            Constraint::Length(wanted.min(area.height / 2)),
-        ])
-        .areas(area);
-        draw_courses(frame, list, app);
-        draw_calendar(frame, calendar, app, now);
+    let rows = app.visible_rows().len().max(1) as u16 + 1;
+    // The calendar needs a title, the weekday names and a few lines per week.
+    let wanted_calendar: u16 = 2 + 6 * 3;
+    let list = if area.height <= 12 {
+        area.height
     } else {
-        draw_courses(frame, area, app);
+        rows.min(
+            area.height
+                .saturating_sub(wanted_calendar)
+                .max(area.height / 3)
+                .max(4),
+        )
+    };
+    let [top, rule, bottom] = Layout::vertical([
+        Constraint::Length(list),
+        Constraint::Length(u16::from(area.height > list)),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    draw_courses(frame, top, app);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(usize::from(rule.width)),
+            theme::faint(),
+        )),
+        rule,
+    );
+    if bottom.height >= 6 {
+        draw_month(frame, bottom, app, now);
     }
 }
 
-/// Upcoming deadlines and events, grouped by day. `Tab` gives it focus.
-fn draw_calendar(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) {
-    use crate::calendar::{self, Kind, Progress};
-    let focused = app.focus() == Section::Calendar;
-    let width = usize::from(area.width);
-    let items = app.calendar_items();
-    let mut lines: Vec<Line> = vec![section_heading(
-        format!("Upcoming · {} days", calendar::DAYS),
-        focused,
-        width.saturating_sub(1),
-    )];
-    if items.is_empty() {
-        let (text, style) = match (&app.planner.data, &app.planner.sync) {
-            (None, SyncState::Failed(e)) => (
-                format!("Calendar unavailable: {}", e.describe()),
-                theme::error(),
-            ),
-            (None, _) => ("Loading calendar…".to_string(), theme::muted()),
-            _ => (
-                format!("Nothing due in the next {} days.", calendar::DAYS),
-                theme::muted(),
-            ),
-        };
-        lines.push(Line::styled(text, style));
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
-    }
+/// A course's colour: the one chosen in Canvas, else one from a fixed set.
+fn course_style(app: &App, course_id: &str) -> Style {
+    const PALETTE: [(u8, u8, u8); 8] = [
+        (115, 190, 255),
+        (250, 140, 80),
+        (120, 210, 140),
+        (230, 130, 210),
+        (240, 200, 90),
+        (150, 160, 255),
+        (90, 210, 210),
+        (230, 110, 110),
+    ];
+    let chosen = app
+        .colors
+        .data
+        .as_ref()
+        .and_then(|c| c.get(course_id))
+        .and_then(|hex| crate::calendar::parse_hex(hex));
+    let (r, g, b) = chosen.unwrap_or_else(|| {
+        let index = app
+            .courses
+            .data
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .position(|c| c.id == course_id)
+            .unwrap_or(course_id.len());
+        PALETTE[index % PALETTE.len()]
+    });
+    // Dark colours are hard to read on a dark terminal: lighten them.
+    let light = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+    let lift = |c: u8| if light < 110 { c / 2 + 110 } else { c };
+    theme::color(ratatui::style::Color::Rgb(lift(r), lift(g), lift(b)))
+}
+
+/// The month grid, like Canvas's calendar: each day lists what is due or
+/// happening, in the course's colour. `Tab` gives it a day cursor.
+fn draw_month(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) {
+    use crate::calendar::{self, Progress};
+    let focus = app.focus();
+    let focused = matches!(focus, Section::Calendar | Section::Day);
+    let day = app.calendar_day;
     let today = now.with_timezone(&Local).date_naive();
-    let selected = app.view().event.min(items.len() - 1);
-    let one_line = width >= 70;
-    let mut selected_row = 0;
-    let mut day = None;
-    for (i, item) in items.iter().enumerate() {
-        if item.day() != day {
-            day = item.day();
-            if let Some(d) = day {
-                lines.push(Line::styled(calendar::day_label(d, today), theme::accent()));
+    let (start, weeks) = calendar::grid(day);
+    let items = app.calendar_items();
+    let width = usize::from(area.width);
+    // Title: month, sync state, keys.
+    let month = app.calendar_month();
+    let state = match month.map(|r| &r.sync) {
+        Some(SyncState::Syncing { .. }) => " · syncing…".to_string(),
+        Some(SyncState::Failed(e)) => format!(" · outdated: {}", e.describe()),
+        _ => String::new(),
+    };
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(
+            day.format(" %B %Y").to_string(),
+            if focused {
+                theme::tab_active()
+            } else {
+                theme::heading()
+            },
+        ),
+        Span::styled(state, theme::muted()),
+        Span::styled(
+            if focused {
+                "   PgUp/PgDn month · Home today"
+            } else {
+                "   Tab to use the calendar"
+            },
+            theme::faint(),
+        ),
+    ])];
+    // The selected day's entries go under the grid while the calendar has focus.
+    let day_items = app.day_items(day);
+    let strip = if focused {
+        (day_items.len().min(4) + 1) as u16
+    } else {
+        0
+    };
+    let col = (width.saturating_sub(1) / 7).max(4);
+    let rule = |i: usize| Span::styled(if i == 0 { " " } else { "│" }, theme::faint());
+    let mut names = Vec::new();
+    for (i, n) in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        .iter()
+        .enumerate()
+    {
+        names.push(rule(i));
+        names.push(Span::styled(pad(n, col - 1), theme::muted()));
+    }
+    lines.push(Line::from(names));
+    let room = usize::from(area.height.saturating_sub(2 + strip));
+    let per_week = (room / weeks).max(1);
+    let item_lines = per_week - 1;
+    for week in 0..weeks {
+        let days: Vec<chrono::NaiveDate> = (0..7)
+            .map(|d| start + chrono::Duration::days((week * 7 + d) as i64))
+            .collect();
+        // Day numbers.
+        let mut spans = Vec::new();
+        for (i, d) in days.iter().enumerate() {
+            let in_month = d.month() == day.month();
+            let label = if *d == today {
+                format!("{}•", d.day())
+            } else {
+                d.day().to_string()
+            };
+            let mut style = if !in_month {
+                theme::faint()
+            } else if *d == today {
+                theme::accent().add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                theme::muted()
+            };
+            if focused && *d == day {
+                style = theme::selected();
             }
+            spans.push(rule(i));
+            spans.push(Span::styled(pad(&label, col - 1), style));
         }
-        let finished = item.progress.finished();
-        let time = item
-            .at
-            .map(|t| t.with_timezone(&Local).format("%-I:%M %p").to_string())
-            .unwrap_or_default();
-        let time_style = theme::due(item.at, finished || item.kind == Kind::Event, now);
-        let course = item
-            .course_id
-            .as_ref()
-            .map(|c| app.course_code(c))
-            .filter(|c| !c.is_empty())
-            .or_else(|| item.course.clone())
-            .unwrap_or_default();
-        let mut tags = Vec::new();
-        if item.kind != Kind::Assignment {
-            tags.push(item.kind.label().to_string());
+        lines.push(Line::from(spans));
+        // Entries, one per line per day; the last line says how many more.
+        let per_day: Vec<Vec<&calendar::Item>> = days
+            .iter()
+            .map(|d| items.iter().filter(|i| i.day() == Some(*d)).collect())
+            .collect();
+        for line in 0..item_lines {
+            let mut spans = Vec::new();
+            for (i, entries) in per_day.iter().enumerate() {
+                spans.push(rule(i));
+                let more = entries.len().saturating_sub(item_lines);
+                let text = if more > 0 && line == item_lines - 1 {
+                    Span::styled(pad(&format!("+{} more", more + 1), col - 1), theme::muted())
+                } else if let Some(item) = entries.get(line) {
+                    let mut style = item
+                        .course_id
+                        .as_deref()
+                        .map(|c| course_style(app, c))
+                        .unwrap_or_else(theme::text);
+                    if item.progress.finished() {
+                        style = style.add_modifier(ratatui::style::Modifier::DIM);
+                    }
+                    let mark = if item.progress == Progress::Missing {
+                        "!"
+                    } else {
+                        ""
+                    };
+                    let title = format!("{mark}{}", html::sanitize(&item.title));
+                    Span::styled(
+                        pad(&title, col - 1),
+                        if mark.is_empty() {
+                            style
+                        } else {
+                            theme::error()
+                        },
+                    )
+                } else {
+                    Span::raw(" ".repeat(col - 1))
+                };
+                spans.push(text);
+            }
+            lines.push(Line::from(spans));
         }
-        if item.progress != Progress::Open {
-            tags.push(item.progress.label().to_string());
+    }
+    let grid_lines = lines.len();
+    if focused {
+        lines.truncate(grid_lines.min(usize::from(area.height.saturating_sub(strip))));
+        lines.push(Line::styled(
+            format!(
+                " {}",
+                calendar::day_label(day, today) + &day.format(" · %A, %B %-d").to_string()
+            ),
+            theme::accent(),
+        ));
+        if day_items.is_empty() {
+            lines.push(Line::styled("   Nothing on this day.", theme::muted()));
         }
-        let tag_style = match item.progress {
-            Progress::Missing => theme::error(),
-            p if p.finished() => theme::tone(crate::model::Tone::Good),
-            _ => theme::muted(),
-        };
-        let title_style = if finished {
-            theme::muted()
-        } else {
-            theme::text()
-        };
-        let tag = tags.join(" · ");
-        let mut first = vec![Span::styled(format!(" {time:>8}  "), time_style)];
-        let row = if one_line {
-            let code = truncate(&html::sanitize(&course), 12);
-            let room = width.saturating_sub(12 + code.width() + 2 + tag.width() + 2);
-            first.push(Span::styled(format!("{code}  "), theme::code()));
-            first.push(Span::styled(
-                pad(&html::sanitize(&item.title), room),
-                title_style,
-            ));
-            first.push(Span::styled(format!("  {tag}"), tag_style));
-            vec![Line::from(first)]
-        } else {
-            let room = width.saturating_sub(12);
-            first.push(Span::styled(
-                pad(&html::sanitize(&item.title), room),
-                title_style,
-            ));
-            let mut second = vec![
-                Span::raw(" ".repeat(11)),
+        for (i, item) in day_items.iter().take(4).enumerate() {
+            let time = item
+                .at
+                .map(|t| t.with_timezone(&Local).format("%-I:%M %p").to_string())
+                .unwrap_or_default();
+            let course = item
+                .course_id
+                .as_deref()
+                .map(|c| app.course_code(c))
+                .filter(|c| !c.is_empty())
+                .or_else(|| item.course.clone())
+                .unwrap_or_default();
+            let mut tags = Vec::new();
+            if item.kind != calendar::Kind::Assignment {
+                tags.push(item.kind.label());
+            }
+            if item.progress != Progress::Open {
+                tags.push(item.progress.label());
+            }
+            let style = item
+                .course_id
+                .as_deref()
+                .map(|c| course_style(app, c))
+                .unwrap_or_else(theme::text);
+            let mut line = Line::from(vec![
                 Span::styled(
-                    truncate(
-                        &html::sanitize(&course),
-                        room.saturating_sub(tag.width() + 3),
-                    ),
-                    theme::code(),
+                    format!("   {time:>8}  "),
+                    theme::due(item.at, item.progress.finished(), now),
                 ),
-            ];
-            if !tag.is_empty() {
-                second.push(Span::styled(format!(" · {tag}"), tag_style));
-            }
-            vec![Line::from(first), Line::from(second)]
-        };
-        if i == selected {
-            selected_row = lines.len();
-        }
-        for mut line in row {
-            if focused && i == selected {
+                Span::styled(
+                    format!("{}  ", truncate(&html::sanitize(&course), 14)),
+                    style,
+                ),
+                Span::raw(html::sanitize(&item.title)),
+                Span::styled(
+                    if tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", tags.join(" · "))
+                    },
+                    if item.progress == Progress::Missing {
+                        theme::error()
+                    } else {
+                        theme::muted()
+                    },
+                ),
+            ]);
+            if focus == Section::Day && i == app.day_item {
                 line = line.style(theme::selected());
             }
             lines.push(line);
         }
     }
-    let height = usize::from(area.height);
-    let skip = if focused {
-        (selected_row + 3)
-            .saturating_sub(height)
-            .min(lines.len().saturating_sub(height))
-    } else {
-        0
-    };
-    frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -801,7 +901,8 @@ fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
                 } else {
                     Style::default()
                 }),
-                Cell::from(c.course_code.clone().unwrap_or_default()).style(theme::code()),
+                Cell::from(c.course_code.clone().unwrap_or_default())
+                    .style(course_style(app, &c.id)),
                 Cell::from(
                     c.term
                         .as_ref()
@@ -1892,7 +1993,7 @@ fn draw_page(
         let start = match focus {
             Section::Links => anchors.links,
             Section::Submissions => anchors.submissions,
-            Section::Text | Section::Calendar => None,
+            Section::Text | Section::Calendar | Section::Day => None,
         };
         if let Some(start) = start {
             view.scroll = start;
@@ -1916,7 +2017,7 @@ fn draw_page(
                 view.scroll = row.saturating_sub(1);
             }
         }
-        Section::Text | Section::Calendar => {}
+        Section::Text | Section::Calendar | Section::Day => {}
     }
     view.scroll = view.scroll.min(max_scroll);
     let scroll = view.scroll;
@@ -2287,7 +2388,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(keys, vec![ResourceKey::Courses, ResourceKey::Planner]);
+        assert_eq!(
+            keys,
+            vec![
+                ResourceKey::Courses,
+                ResourceKey::Planner(crate::calendar::month_key(app.calendar_day)),
+                ResourceKey::Colors
+            ]
+        );
         assert!(app.menu.is_none());
         // `?` lists the keys of this screen and the menu-only actions.
         send(&mut app, KeyCode::Char('?'));
@@ -2313,27 +2421,42 @@ mod tests {
     }
 
     #[test]
-    fn home_screen_shows_the_calendar_and_tab_focuses_it() {
+    fn home_screen_has_the_courses_then_a_month_calendar() {
         use crate::calendar::{Item, Kind, Progress};
+        use chrono::TimeZone;
         let now = Utc::now();
         let mut app = App::new("https://ufl.instructure.com", None);
         let effects = app.start();
-        let keys: Vec<_> = effects
+        let fetches: Vec<(ResourceKey, u64)> = effects
             .iter()
             .filter_map(|e| match e {
                 crate::app::Effect::Fetch { key, request } => Some((key.clone(), *request)),
                 _ => None,
             })
             .collect();
-        assert_eq!(keys.len(), 2, "courses and calendar are read together");
-        let (planner_key, planner_request) = keys[1].clone();
-        assert_eq!(planner_key, ResourceKey::Planner);
-        deliver(
+        let month = crate::calendar::month_key(app.calendar_day);
+        assert_eq!(
+            fetches.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![
+                ResourceKey::Courses,
+                ResourceKey::Planner(month.clone()),
+                ResourceKey::Colors
+            ],
+            "courses, the month shown and course colours are read together"
+        );
+        let send_fetch = |app: &mut App, i: usize, payload: Payload| {
+            deliver(
+                app,
+                vec![crate::app::Effect::Fetch {
+                    key: fetches[i].0.clone(),
+                    request: fetches[i].1,
+                }],
+                payload,
+            )
+        };
+        send_fetch(
             &mut app,
-            vec![crate::app::Effect::Fetch {
-                key: keys[0].0.clone(),
-                request: keys[0].1,
-            }],
+            0,
             Payload::Courses(vec![Course {
                 id: "10".into(),
                 name: Some("GPU Computing".into()),
@@ -2341,73 +2464,78 @@ mod tests {
                 ..Default::default()
             }]),
         );
-        let item = |id: &str, kind, title: &str, hours: i64, progress| Item {
+        let today = app.calendar_day;
+        let noon = |d: chrono::NaiveDate| {
+            chrono::Local
+                .from_local_datetime(&d.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let item = |id: &str, kind, title: &str, day: chrono::NaiveDate, progress| Item {
             kind,
             id: id.into(),
             course_id: Some("10".into()),
             course: Some("GPU Computing".into()),
             title: title.into(),
-            at: Some(now + chrono::Duration::hours(hours)),
+            at: Some(noon(day)),
             points: None,
             url: Some(format!("/courses/10/assignments/{id}")),
             progress,
         };
-        deliver(
+        send_fetch(
             &mut app,
-            vec![crate::app::Effect::Fetch {
-                key: planner_key,
-                request: planner_request,
-            }],
+            1,
             Payload::Planner(vec![
-                item(
-                    "7",
-                    Kind::Assignment,
-                    "Lab-3 Assignment",
-                    30,
-                    Progress::Open,
-                ),
-                item("8", Kind::Quiz, "Quiz 4", 54, Progress::Missing),
-                item("9", Kind::Announcement, "News", 2, Progress::Open),
+                item("7", Kind::Assignment, "Lab-3", today, Progress::Open),
+                item("8", Kind::Quiz, "Quiz 4", today, Progress::Missing),
+                item("9", Kind::Announcement, "News", today, Progress::Open),
             ]),
         );
-        let wide = screen(&mut app, 120, 14);
-        println!("{wide}\n");
+        send_fetch(
+            &mut app,
+            2,
+            Payload::Colors([("10".to_string(), "#0021A5".to_string())].into()),
+        );
+        let home = screen(&mut app, 112, 30);
+        println!("{home}\n");
+        let month_name = today.format("%B %Y").to_string();
         assert!(
-            wide.contains("Upcoming · 14 days")
-                && wide.contains("Lab-3 Assignment")
-                && wide.contains("missing"),
-            "{wide}"
+            home.contains("GPU Computing") && home.contains(&month_name),
+            "{home}"
         );
         assert!(
-            !wide.contains("News"),
+            home.contains("Sun")
+                && home.contains("Sat")
+                && home.contains("Lab-3")
+                && home.contains("!Quiz 4"),
+            "{home}"
+        );
+        assert!(
+            !home.contains("News"),
             "announcements are not calendar entries"
         );
-        let narrow = screen(&mut app, 80, 20);
-        println!("{narrow}\n");
-        assert!(
-            narrow.contains("Quiz 4") && narrow.contains("EEL5934"),
-            "{narrow}"
-        );
-        // Tab moves to the calendar; Enter on an assignment opens it here.
+        // Tab: a day cursor; Enter on a day with several entries lists them.
         let send = |app: &mut App, code: KeyCode| {
             app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
         };
         send(&mut app, KeyCode::Tab);
         assert_eq!(app.focus(), Section::Calendar);
+        assert!(send(&mut app, KeyCode::Enter).is_empty());
+        assert_eq!(app.focus(), Section::Day);
+        let listed = screen(&mut app, 112, 30);
+        println!("{listed}\n");
         assert!(
-            screen(&mut app, 120, 14)
-                .lines()
-                .last()
-                .unwrap()
-                .contains("Tab calendar")
+            listed.contains("Today ·") && listed.contains("Quiz · missing"),
+            "{listed}"
         );
         let effects = send(&mut app, KeyCode::Enter);
         assert!(
-            matches!(&effects[..], [crate::app::Effect::Fetch { key: ResourceKey::Detail(c, a), .. }] if c == "10" && a == "7"),
+            matches!(&effects[..], [crate::app::Effect::Fetch { key: ResourceKey::Detail(c, a), .. }, ..] if c == "10" && a == "7"),
             "{effects:?}"
         );
         send(&mut app, KeyCode::Esc);
-        // Anything else opens in the browser.
+        assert_eq!(app.focus(), Section::Day, "the list keeps its place");
         send(&mut app, KeyCode::Down);
         assert_eq!(
             send(&mut app, KeyCode::Enter),
@@ -2415,8 +2543,22 @@ mod tests {
                 "https://ufl.instructure.com/courses/10/assignments/8".into()
             )]
         );
+        // Arrows move days; PgDn shows (and reads) the next month; Home returns to today.
+        send(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Section::Calendar);
+        send(&mut app, KeyCode::Right);
+        assert_eq!(app.calendar_day, today + chrono::Duration::days(1));
+        let effects = send(&mut app, KeyCode::PageDown);
+        let next = crate::calendar::month_key(crate::calendar::shift_month(
+            today + chrono::Duration::days(1),
+            1,
+        ));
+        assert!(effects.iter().any(|e| matches!(e, crate::app::Effect::Fetch { key: ResourceKey::Planner(m), .. } if *m == next)), "{effects:?}");
+        send(&mut app, KeyCode::Home);
+        assert_eq!(app.calendar_day, today);
         send(&mut app, KeyCode::Esc);
         assert_eq!(app.focus(), Section::Text);
+        let _ = now;
     }
 
     /// Replays private saved responses without printing announcement contents.
