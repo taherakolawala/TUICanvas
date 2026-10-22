@@ -40,6 +40,8 @@ foreach ($task in ($Tasks -split ' ')) {
         'survey'  { Step 'survey' { & $python -m tools.survey_assignments } }
         'files-probe' { Step 'files-probe' { & $python -m tools.probe_files } }
         'announcements-probe' { Step 'announcements-probe' { & $python -m tools.probe_announcements } }
+        'modules-probe' { Step 'modules-probe' { & $python -m tools.probe_modules } }
+        'modules-live' { Step 'modules-live' { cargo test --release live_modules -- --ignored --nocapture } }
         'calendar-probe' { Step 'calendar-probe' { & $python -m tools.probe_calendar } }
         'announcements-parity' { Step 'announcements-parity' { & $python -m tools.probe_announcements --parity } }
         'bench-browser' { Step 'bench-browser' { & $python -m tools.browser_bench --runs 10 } }

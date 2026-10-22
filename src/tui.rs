@@ -12,7 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use tokio::sync::Semaphore;
 
 use crate::api;
-use crate::app::{App, CourseFilesData, Effect, Msg, Payload, TransferEvent};
+use crate::app::{App, CourseFilesData, CourseTab, Effect, Msg, Payload, TransferEvent};
 use crate::cache::{ResourceKey, SnapshotStore};
 use crate::canvas::CanvasClient;
 use crate::config::Config;
@@ -122,6 +122,15 @@ impl Executor {
                 ResourceKey::File(f) => api::file(&client, f)
                     .await
                     .map(|(v, s)| (Payload::File(Box::new(v)), s)),
+                ResourceKey::Tabs(c) => crate::modules::tabs(&client, c)
+                    .await
+                    .map(|(v, s)| (Payload::Tabs(v), s)),
+                ResourceKey::Modules(c) => crate::modules::list(&client, c)
+                    .await
+                    .map(|(v, s)| (Payload::Modules(v), s)),
+                ResourceKey::WikiPage(c, u) => crate::modules::page(&client, c, u)
+                    .await
+                    .map(|(v, s)| (Payload::WikiPage(Box::new(v)), s)),
             };
             let at = Utc::now();
             if let Ok((payload, _)) = &result {
@@ -136,6 +145,9 @@ impl Executor {
                     Payload::History(_) => {}
                     Payload::Files(v) => store.save(&key, v.as_ref(), at),
                     Payload::File(v) => store.save(&key, v.as_ref(), at),
+                    Payload::Tabs(v) => store.save(&key, v, at),
+                    Payload::Modules(v) => store.save(&key, v, at),
+                    Payload::WikiPage(v) => store.save(&key, v.as_ref(), at),
                 }
             }
             persist_rotated_cookies(&client, &session, &session_path);
@@ -841,6 +853,15 @@ pub fn dump(config: &Config, out: &Path, course: &str, assignment: &str) -> Resu
     }
     let effects = app.update(press(KeyCode::Enter));
     step(&mut app, effects, "2-assignments", &mut timings)?;
+    // A course opens on its first Canvas tab; go to Assignments if it is shown.
+    let tab_now = |app: &App| app.view().kind.tab().map(|(t, ..)| t);
+    for _ in 0..4 {
+        if tab_now(&app) == Some(CourseTab::Assignments) {
+            break;
+        }
+        let effects = app.update(press(KeyCode::Tab));
+        step(&mut app, effects, "2b-assignments", &mut timings)?;
+    }
     if let Some(index) = find(&app, assignment) {
         for _ in 0..index {
             app.update(press(KeyCode::Down));
@@ -850,8 +871,38 @@ pub fn dump(config: &Config, out: &Path, course: &str, assignment: &str) -> Resu
     step(&mut app, effects, "3-detail", &mut timings)?;
     let effects = app.update(press(KeyCode::Esc));
     step(&mut app, effects, "4-back-to-assignments", &mut timings)?;
-    let effects = app.update(press(KeyCode::Tab));
-    step(&mut app, effects, "5-files", &mut timings)?;
+    // Modules, and the first page in them, when Canvas shows Modules.
+    while app.stack.len() > 2 {
+        app.update(press(KeyCode::Esc));
+    }
+    for _ in 0..4 {
+        if tab_now(&app) == Some(CourseTab::Modules) {
+            break;
+        }
+        let effects = app.update(press(KeyCode::Tab));
+        step(&mut app, effects, "4b-modules", &mut timings)?;
+    }
+    if let crate::app::ViewKind::Modules { course_id, .. } = app.view().kind.clone() {
+        let rows = app.module_rows(&course_id);
+        let page = app.visible_rows().iter().position(|&i| {
+            matches!(rows.get(i), Some(crate::app::ModuleRow::Item(_, it)) if it.page().is_some())
+        });
+        if let Some(page) = page {
+            app.stack.last_mut().expect("a view").selected = page;
+            let effects = app.update(press(KeyCode::Enter));
+            step(&mut app, effects, "4c-page", &mut timings)?;
+        }
+    }
+    while app.stack.len() > 2 {
+        app.update(press(KeyCode::Esc));
+    }
+    for _ in 0..4 {
+        let effects = app.update(press(KeyCode::Tab));
+        step(&mut app, effects, "5-files", &mut timings)?;
+        if tab_now(&app) == Some(CourseTab::Files) {
+            break;
+        }
+    }
     // Into the folder with the most files (no read: the listing covers the course).
     let count = |folder: &str| {
         app.course_files

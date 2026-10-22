@@ -15,6 +15,7 @@ use crate::html::{Link, Target};
 use crate::keys::{self, Act, Scope};
 use crate::library::{self, Library, LocalState};
 use crate::model::{AssignmentDetail, AssignmentSummary, CanvasFile, CanvasFolder, Course};
+use crate::modules::ItemKind;
 use crate::submission::{self, FileChoice};
 
 /// An in-flight read that started at most this long before an access may
@@ -70,6 +71,84 @@ pub enum Payload {
     File(Box<CanvasFile>),
     Planner(Vec<crate::calendar::Item>),
     Colors(HashMap<String, String>),
+    Tabs(Vec<crate::modules::Tab>),
+    Modules(Vec<crate::modules::Module>),
+    WikiPage(Box<crate::modules::WikiPage>),
+}
+
+/// One row of the Modules screen: a module's heading or one of its items.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ModuleRow<'a> {
+    Module(&'a crate::modules::Module),
+    Item(&'a crate::modules::Module, &'a crate::modules::Item),
+}
+
+impl ModuleRow<'_> {
+    /// Headings (modules and text headers) are not selectable.
+    pub fn selectable(&self) -> bool {
+        matches!(self, ModuleRow::Item(_, i) if i.kind() != crate::modules::ItemKind::Heading)
+    }
+}
+
+/// A course section the reader can show, when Canvas shows its tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CourseTab {
+    Assignments,
+    Announcements,
+    Files,
+    Modules,
+}
+
+impl CourseTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            CourseTab::Assignments => "Assignments",
+            CourseTab::Announcements => "Announcements",
+            CourseTab::Files => "Files",
+            CourseTab::Modules => "Modules",
+        }
+    }
+
+    fn of_canvas(id: &str) -> Option<CourseTab> {
+        match id {
+            "assignments" => Some(CourseTab::Assignments),
+            "announcements" => Some(CourseTab::Announcements),
+            "files" => Some(CourseTab::Files),
+            "modules" => Some(CourseTab::Modules),
+            _ => None,
+        }
+    }
+
+    pub fn view(self, course_id: String, course_name: String) -> ViewKind {
+        match self {
+            CourseTab::Assignments => ViewKind::Assignments {
+                course_id,
+                course_name,
+            },
+            CourseTab::Announcements => ViewKind::Announcements {
+                course_id,
+                course_name,
+            },
+            CourseTab::Files => ViewKind::Files {
+                course_id,
+                course_name,
+                folder_id: None,
+            },
+            CourseTab::Modules => ViewKind::Modules {
+                course_id,
+                course_name,
+            },
+        }
+    }
+}
+
+/// A module file waiting for its details before it can be placed.
+#[derive(Clone, Debug, PartialEq)]
+struct ModuleFile {
+    course_id: String,
+    module: String,
+    open: bool,
+    quiet: bool,
 }
 
 /// A course's Files area as the reader keeps it.
@@ -240,6 +319,8 @@ pub struct MenuState {
 pub enum Page {
     Assignment(String, String),
     Announcement(String, String),
+    /// A course wiki page: course id and the page's URL name.
+    Wiki(String, String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -271,6 +352,21 @@ pub enum ViewKind {
         course_name: String,
         folder_id: Option<String>,
     },
+    Modules {
+        course_id: String,
+        course_name: String,
+    },
+    WikiPage {
+        course_id: String,
+        course_name: String,
+        page_url: String,
+        title: String,
+    },
+    /// A course where Canvas shows none of the sections the reader has.
+    CourseHome {
+        course_id: String,
+        course_name: String,
+    },
 }
 
 impl ViewKind {
@@ -289,7 +385,47 @@ impl ViewKind {
                 course_id.clone(),
                 announcement_id.clone(),
             )),
+            ViewKind::WikiPage {
+                course_id,
+                page_url,
+                ..
+            } => Some(Page::Wiki(course_id.clone(), page_url.clone())),
             _ => None,
+        }
+    }
+
+    /// The course section this view is, with the course.
+    pub fn tab(&self) -> Option<(CourseTab, &str, &str)> {
+        match self {
+            ViewKind::Assignments {
+                course_id,
+                course_name,
+            } => Some((CourseTab::Assignments, course_id, course_name)),
+            ViewKind::Announcements {
+                course_id,
+                course_name,
+            } => Some((CourseTab::Announcements, course_id, course_name)),
+            ViewKind::Files {
+                course_id,
+                course_name,
+                ..
+            } => Some((CourseTab::Files, course_id, course_name)),
+            ViewKind::Modules {
+                course_id,
+                course_name,
+            } => Some((CourseTab::Modules, course_id, course_name)),
+            _ => None,
+        }
+    }
+
+    /// The course of a course section or the empty course screen.
+    fn course(&self) -> Option<(&str, &str)> {
+        match self {
+            ViewKind::CourseHome {
+                course_id,
+                course_name,
+            } => Some((course_id, course_name)),
+            _ => self.tab().map(|(_, c, n)| (c, n)),
         }
     }
 }
@@ -346,6 +482,13 @@ impl View {
                 ..
             } => ResourceKey::Detail(course_id.clone(), assignment_id.clone()),
             ViewKind::Files { course_id, .. } => ResourceKey::Files(course_id.clone()),
+            ViewKind::Modules { course_id, .. } => ResourceKey::Modules(course_id.clone()),
+            ViewKind::WikiPage {
+                course_id,
+                page_url,
+                ..
+            } => ResourceKey::WikiPage(course_id.clone(), page_url.clone()),
+            ViewKind::CourseHome { course_id, .. } => ResourceKey::Tabs(course_id.clone()),
         }
     }
 }
@@ -416,6 +559,14 @@ pub struct App {
     pub menu: Option<MenuState>,
     /// The help screen, with its scroll position.
     pub help: Option<usize>,
+    /// Course tabs Canvas shows; read once per run (and on `r`).
+    pub tabs: HashMap<String, Resource<Vec<crate::modules::Tab>>>,
+    tabs_read: std::collections::HashSet<String>,
+    pub modules: HashMap<String, Resource<Vec<crate::modules::Module>>>,
+    pub wiki_pages: HashMap<(String, String), Resource<crate::modules::WikiPage>>,
+    pub wiki_render: Option<DetailRender>,
+    /// Module files waiting for their details (and their course's folders).
+    module_waiting: HashMap<String, ModuleFile>,
 }
 
 fn matches_filter(text: &str, filter: &str) -> bool {
@@ -499,6 +650,12 @@ impl App {
             submission: None,
             menu: None,
             help: None,
+            tabs: HashMap::new(),
+            tabs_read: std::collections::HashSet::new(),
+            modules: HashMap::new(),
+            wiki_pages: HashMap::new(),
+            wiki_render: None,
+            module_waiting: HashMap::new(),
         }
     }
 
@@ -533,6 +690,12 @@ impl App {
             }
             ResourceKey::Files(c) => self.course_files.get(c).map(|r| &r.sync),
             ResourceKey::File(f) => self.files.get(f).map(|r| &r.sync),
+            ResourceKey::Tabs(c) => self.tabs.get(c).map(|r| &r.sync),
+            ResourceKey::Modules(c) => self.modules.get(c).map(|r| &r.sync),
+            ResourceKey::WikiPage(c, u) => self
+                .wiki_pages
+                .get(&(c.clone(), u.clone()))
+                .map(|r| &r.sync),
         }
     }
 
@@ -565,6 +728,14 @@ impl App {
             }
             ResourceKey::Files(c) => self.course_files.entry(c.clone()).or_default().sync = sync,
             ResourceKey::File(f) => self.files.entry(f.clone()).or_default().sync = sync,
+            ResourceKey::Tabs(c) => self.tabs.entry(c.clone()).or_default().sync = sync,
+            ResourceKey::Modules(c) => self.modules.entry(c.clone()).or_default().sync = sync,
+            ResourceKey::WikiPage(c, u) => {
+                self.wiki_pages
+                    .entry((c.clone(), u.clone()))
+                    .or_default()
+                    .sync = sync
+            }
         }
     }
 
@@ -579,9 +750,18 @@ impl App {
     fn enter_current(&mut self, explicit: bool) -> Vec<Effect> {
         let key = self.view().key();
         self.load_snapshot(&key);
+        self.clamp_selection();
         self.mark_current_announcement_read();
         self.dirty = true;
-        let mut effects: Vec<Effect> = self.request(key, explicit).into_iter().collect();
+        // Course tabs are read once per run, not on every visit.
+        let mut effects: Vec<Effect> = match key {
+            ResourceKey::Tabs(_) => vec![],
+            key => self.request(key, explicit).into_iter().collect(),
+        };
+        if let Some((course_id, _)) = self.view().kind.course() {
+            let course_id = course_id.to_string();
+            effects.extend(self.read_tabs(&course_id, explicit));
+        }
         // The calendar is part of the home screen: read it with the course list.
         if self.view().kind == ViewKind::Courses {
             effects.extend(self.read_calendar(explicit));
@@ -709,6 +889,39 @@ impl App {
             }
             ResourceKey::File(f) => {
                 let res = self.files.entry(f.clone()).or_default();
+                if res.data.is_none()
+                    && let Some((data, at)) = store.load(key)
+                {
+                    res.data = Some(data);
+                    res.fetched_at = Some(at);
+                    res.origin = Origin::Cache;
+                    res.version += 1;
+                }
+            }
+            ResourceKey::Tabs(c) => {
+                let res = self.tabs.entry(c.clone()).or_default();
+                if res.data.is_none()
+                    && let Some((data, at)) = store.load(key)
+                {
+                    res.data = Some(data);
+                    res.fetched_at = Some(at);
+                    res.origin = Origin::Cache;
+                    res.version += 1;
+                }
+            }
+            ResourceKey::Modules(c) => {
+                let res = self.modules.entry(c.clone()).or_default();
+                if res.data.is_none()
+                    && let Some((data, at)) = store.load(key)
+                {
+                    res.data = Some(data);
+                    res.fetched_at = Some(at);
+                    res.origin = Origin::Cache;
+                    res.version += 1;
+                }
+            }
+            ResourceKey::WikiPage(c, u) => {
+                let res = self.wiki_pages.entry((c.clone(), u.clone())).or_default();
                 if res.data.is_none()
                     && let Some((data, at)) = store.load(key)
                 {
@@ -947,6 +1160,7 @@ impl App {
                         r.fetched_at = Some(at);
                         r.sync = SyncState::Idle;
                         r.version += 1;
+                        effects.extend(self.place_module_files());
                     }
                     (Payload::File(file), ResourceKey::File(f)) => {
                         let r = self.files.entry(f.clone()).or_default();
@@ -958,6 +1172,32 @@ impl App {
                         for intent in self.waiting.remove(f).unwrap_or_default() {
                             effects.extend(self.place_file(f, intent));
                         }
+                        effects.extend(self.place_module_files());
+                    }
+                    (Payload::Tabs(list), ResourceKey::Tabs(c)) => {
+                        let r = self.tabs.entry(c.clone()).or_default();
+                        r.data = Some(list);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
+                        effects.extend(self.follow_tabs());
+                    }
+                    (Payload::Modules(list), ResourceKey::Modules(c)) => {
+                        let r = self.modules.entry(c.clone()).or_default();
+                        r.data = Some(list);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
+                    }
+                    (Payload::WikiPage(page), ResourceKey::WikiPage(c, u)) => {
+                        let r = self.wiki_pages.entry((c.clone(), u.clone())).or_default();
+                        r.data = Some(*page);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
                     }
                     _ => self.set_sync(
                         &key,
@@ -980,16 +1220,31 @@ impl App {
                         error.describe()
                     ));
                 }
+                if let ResourceKey::File(f) = &key
+                    && let Some(m) = self.module_waiting.remove(f)
+                    && !m.quiet
+                {
+                    self.notice = Some(format!(
+                        "Could not read that file from Canvas ({}). Press o to open it in the browser.",
+                        error.describe()
+                    ));
+                }
                 self.set_sync(&key, SyncState::Failed(error));
+                // Without the course's folders a module file goes to Module Files.
+                let mut effects = if matches!(key, ResourceKey::Files(_)) {
+                    self.place_module_files()
+                } else {
+                    vec![]
+                };
                 if needs_login {
                     self.login_required = true;
                     // A session found dead at startup goes straight to sign-in;
                     // later expiry waits for the user to press L.
                     if first_result {
-                        return vec![Effect::Login];
+                        effects.push(Effect::Login);
                     }
                 }
-                vec![]
+                effects
             }
         }
     }
@@ -1032,17 +1287,195 @@ impl App {
                 .filter(|(_, a)| matches_filter(a.title(), &view.filter))
                 .map(|(i, _)| i)
                 .collect(),
-            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => vec![],
+            ViewKind::Detail { .. }
+            | ViewKind::Announcement { .. }
+            | ViewKind::WikiPage { .. }
+            | ViewKind::CourseHome { .. } => vec![],
             ViewKind::Files { .. } => (0..self.file_rows().len()).collect(),
+            ViewKind::Modules { course_id, .. } => self.visible_modules(course_id, &view.filter),
         }
     }
 
+    /// Whether each visible row can be selected (module headings cannot).
+    fn row_selectable(&self) -> Vec<bool> {
+        match &self.view().kind {
+            ViewKind::Modules { course_id, .. } => {
+                let rows = self.module_rows(course_id);
+                self.visible_rows()
+                    .iter()
+                    .map(|&i| rows.get(i).is_some_and(|r| r.selectable()))
+                    .collect()
+            }
+            _ => vec![true; self.visible_rows().len()],
+        }
+    }
+
+    /// The nearest selectable row from `at`, looking in `step`'s direction first.
+    fn nearest_selectable(selectable: &[bool], at: usize, step: isize) -> usize {
+        let len = selectable.len() as isize;
+        let first = if step < 0 { -1 } else { 1 };
+        for dir in [first, -first] {
+            let mut i = at as isize;
+            while (0..len).contains(&i) {
+                if selectable[i as usize] {
+                    return i as usize;
+                }
+                i += dir;
+            }
+        }
+        at
+    }
+
     fn clamp_selection(&mut self) {
-        let len = self.visible_rows().len();
+        let selectable = self.row_selectable();
+        let len = selectable.len();
         let view = self.view_mut();
         if view.selected >= len {
             view.selected = len.saturating_sub(1);
         }
+        if len > 0 && !selectable[view.selected] {
+            view.selected = Self::nearest_selectable(&selectable, view.selected, 1);
+        }
+    }
+
+    /// Every module heading and item of a course, in order.
+    pub fn module_rows(&self, course_id: &str) -> Vec<ModuleRow<'_>> {
+        let mut rows = Vec::new();
+        for m in self
+            .modules
+            .get(course_id)
+            .and_then(|r| r.data.as_deref())
+            .unwrap_or(&[])
+        {
+            rows.push(ModuleRow::Module(m));
+            rows.extend(m.items().iter().map(|i| ModuleRow::Item(m, i)));
+        }
+        rows
+    }
+
+    /// Module rows matching a search: matching items under their module's
+    /// heading, or a whole module whose name matches.
+    fn visible_modules(&self, course_id: &str, filter: &str) -> Vec<usize> {
+        let modules = self
+            .modules
+            .get(course_id)
+            .and_then(|r| r.data.as_deref())
+            .unwrap_or(&[]);
+        let mut out = Vec::new();
+        let mut at = 0;
+        for m in modules {
+            let head = at;
+            let whole = matches_filter(m.name(), filter);
+            let hits: Vec<usize> = m
+                .items()
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| whole || matches_filter(i.title(), filter))
+                .map(|(k, _)| head + 1 + k)
+                .collect();
+            if whole || !hits.is_empty() {
+                out.push(head);
+                out.extend(hits);
+            }
+            at += 1 + m.items().len();
+        }
+        out
+    }
+
+    /// The selected row of the Modules screen.
+    pub fn selected_module_row(&self) -> Option<ModuleRow<'_>> {
+        let ViewKind::Modules { course_id, .. } = &self.view().kind else {
+            return None;
+        };
+        let index = *self.visible_rows().get(self.view().selected)?;
+        self.module_rows(course_id).get(index).copied()
+    }
+
+    /// The course sections Canvas shows, in its order. The course home comes
+    /// first when it is modules or assignments, since Canvas shows those on
+    /// Home even with their own tab hidden. Before the tabs are known, all.
+    pub fn course_tabs(&self, course_id: &str) -> Vec<CourseTab> {
+        let Some(list) = self.tabs.get(course_id).and_then(|r| r.data.as_ref()) else {
+            return vec![
+                CourseTab::Assignments,
+                CourseTab::Files,
+                CourseTab::Announcements,
+                CourseTab::Modules,
+            ];
+        };
+        let home = self
+            .courses
+            .data
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|c| c.id == course_id)
+            .and_then(|c| c.default_view.as_deref());
+        let mut out = Vec::new();
+        match home {
+            Some("modules") => out.push(CourseTab::Modules),
+            Some("assignments") => out.push(CourseTab::Assignments),
+            _ => {}
+        }
+        for tab in list.iter().filter_map(|t| CourseTab::of_canvas(&t.id)) {
+            if !out.contains(&tab) {
+                out.push(tab);
+            }
+        }
+        out
+    }
+
+    /// Where a course opens: its first section, or the empty course screen.
+    fn course_view(&self, course_id: &str, course_name: &str) -> ViewKind {
+        match self.course_tabs(course_id).first() {
+            Some(tab) => tab.view(course_id.to_string(), course_name.to_string()),
+            None => ViewKind::CourseHome {
+                course_id: course_id.to_string(),
+                course_name: course_name.to_string(),
+            },
+        }
+    }
+
+    /// Read a course's tabs: from the saved copy now, from Canvas once per run.
+    fn read_tabs(&mut self, course_id: &str, explicit: bool) -> Vec<Effect> {
+        let key = ResourceKey::Tabs(course_id.to_string());
+        self.load_snapshot(&key);
+        if !self.tabs_read.insert(course_id.to_string()) && !explicit {
+            return vec![];
+        }
+        self.request(key, explicit).into_iter().collect()
+    }
+
+    /// After the tabs change: leave a section the instructor hid.
+    fn follow_tabs(&mut self) -> Vec<Effect> {
+        let kind = self.view().kind.clone();
+        let Some((course_id, course_name)) = kind.course() else {
+            return vec![];
+        };
+        let tabs = self.course_tabs(course_id);
+        let shown = match kind.tab() {
+            Some((tab, ..)) => tabs.contains(&tab),
+            None => tabs.is_empty(),
+        };
+        if shown {
+            return vec![];
+        }
+        let next = self.course_view(course_id, course_name);
+        self.replace_tab(next)
+    }
+
+    /// Show another section of the same course in place of this one.
+    fn replace_tab(&mut self, next: ViewKind) -> Vec<Effect> {
+        while self.stack.len() > 1
+            && matches!(
+                self.stack[self.stack.len() - 2].kind,
+                ViewKind::Files { .. }
+            )
+        {
+            self.stack.pop();
+        }
+        *self.view_mut() = View::new(next);
+        self.enter_current(false)
     }
 
     fn page(&self) -> usize {
@@ -1052,20 +1485,21 @@ impl App {
     fn is_list(&self) -> bool {
         !matches!(
             self.view().kind,
-            ViewKind::Detail { .. } | ViewKind::Announcement { .. }
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. } | ViewKind::WikiPage { .. }
         )
     }
 
     fn move_selection(&mut self, delta: isize) {
         if self.is_list() {
-            let len = self.visible_rows().len();
+            let selectable = self.row_selectable();
+            let len = selectable.len();
             let view = self.view_mut();
             if len == 0 {
                 view.selected = 0;
                 return;
             }
-            let target = view.selected as isize + delta;
-            view.selected = target.clamp(0, len as isize - 1) as usize;
+            let target = (view.selected as isize + delta).clamp(0, len as isize - 1) as usize;
+            view.selected = Self::nearest_selectable(&selectable, target, delta);
         } else {
             let view = self.view_mut();
             view.scroll = (view.scroll as isize + delta).max(0) as usize;
@@ -1100,6 +1534,19 @@ impl App {
                     course_id: c,
                     course_name,
                     ..
+                }
+                | ViewKind::Modules {
+                    course_id: c,
+                    course_name,
+                }
+                | ViewKind::WikiPage {
+                    course_id: c,
+                    course_name,
+                    ..
+                }
+                | ViewKind::Announcements {
+                    course_id: c,
+                    course_name,
                 } if c == course_id => Some(course_name.clone()),
                 _ => None,
             })
@@ -1744,8 +2191,12 @@ impl App {
             ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => {
                 scopes.extend([Scope::List, Scope::CourseTabs])
             }
-            ViewKind::Files { .. } => scopes.extend([Scope::List, Scope::CourseTabs, Scope::Files]),
-            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => {
+            // Modules share the Files keys: d, D and e work on module files.
+            ViewKind::Files { .. } | ViewKind::Modules { .. } => {
+                scopes.extend([Scope::List, Scope::CourseTabs, Scope::Files])
+            }
+            ViewKind::CourseHome { .. } => {}
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. } | ViewKind::WikiPage { .. } => {
                 scopes.push(Scope::Page);
                 if matches!(view.kind, ViewKind::Detail { .. }) {
                     scopes.push(Scope::Assignment);
@@ -1813,6 +2264,7 @@ impl App {
         match page {
             Page::Assignment(c, a) => self.links_of(c, a),
             Page::Announcement(c, a) => self.announcement_links(c, a),
+            Page::Wiki(c, u) => self.wiki_links(c, u),
         }
     }
 
@@ -1820,6 +2272,7 @@ impl App {
         match page {
             Page::Assignment(c, a) => self.detail_dir(c, a),
             Page::Announcement(c, a) => self.announcement_dir(c, a),
+            Page::Wiki(c, u) => self.wiki_dir(c, u),
         }
     }
 
@@ -1855,13 +2308,21 @@ impl App {
             },
             Act::Download => match self.view().kind {
                 ViewKind::Files { .. } => !self.file_rows().is_empty(),
+                ViewKind::Modules { .. } => matches!(
+                    self.selected_module_row(),
+                    Some(ModuleRow::Item(_, i)) if i.kind() == ItemKind::File
+                ),
                 _ => matches!(
                     self.selected_link().map(|l| l.target),
                     Some(Target::File { .. })
                 ),
             },
-            Act::DownloadAll => match self.view().kind {
+            Act::DownloadAll => match &self.view().kind {
                 ViewKind::Files { .. } => !self.file_rows().is_empty(),
+                ViewKind::Modules { course_id, .. } => self
+                    .module_rows(course_id)
+                    .iter()
+                    .any(|r| matches!(r, ModuleRow::Item(_, i) if i.kind() == ItemKind::File)),
                 _ => self
                     .current_links()
                     .iter()
@@ -1880,10 +2341,10 @@ impl App {
                     .is_some_and(|d| d.base.submission_types.iter().any(|t| t == "online_upload")),
                 _ => false,
             },
-            Act::NextSection | Act::PrevSection => {
-                (page.is_none() && self.view().kind != ViewKind::Courses)
-                    || self.sections().len() > 1
-            }
+            Act::NextSection | Act::PrevSection => match self.view().kind.tab() {
+                Some((_, course_id, _)) => self.course_tabs(course_id).len() > 1,
+                None => self.sections().len() > 1,
+            },
             Act::HideCourse => !self.visible_rows().is_empty(),
             Act::Search => self.is_list(),
             _ => true,
@@ -2005,6 +2466,7 @@ impl App {
             return;
         }
         view.selected = 0;
+        self.clamp_selection();
     }
 
     /// Carry out an action.
@@ -2173,6 +2635,7 @@ impl App {
                 v.filter.clear();
                 v.filtering = false;
                 v.selected = 0;
+                self.clamp_selection();
             }
             Act::Up => self.move_selection(-1),
             Act::Down => self.move_selection(1),
@@ -2377,6 +2840,7 @@ impl App {
             let v = self.view_mut();
             v.filter.clear();
             v.selected = 0;
+            self.clamp_selection();
             return vec![];
         }
         if self.view().kind == ViewKind::Courses && self.focus() == Section::Day {
@@ -2504,10 +2968,18 @@ impl App {
         vec![Effect::OpenUrl(self.calendar_url(&item))]
     }
 
-    /// `r`: read this screen again now (and an assignment's past submissions).
+    /// `r`: read this screen again now (and an assignment's past submissions,
+    /// or a course's tabs).
     fn refresh(&mut self) -> Vec<Effect> {
         let key = self.view().key();
-        let mut effects: Vec<Effect> = self.request(key, true).into_iter().collect();
+        let mut effects: Vec<Effect> = match key {
+            ResourceKey::Tabs(_) => vec![],
+            key => self.request(key, true).into_iter().collect(),
+        };
+        if let Some((course_id, _)) = self.view().kind.course() {
+            let course_id = course_id.to_string();
+            effects.extend(self.read_tabs(&course_id, true));
+        }
         if self.view().kind == ViewKind::Courses {
             effects.extend(self.read_calendar(true));
         }
@@ -2534,6 +3006,13 @@ impl App {
         match page {
             Page::Assignment(c, a) => self.activate_link(c, a, link),
             Page::Announcement(c, a) => self.activate_announcement_link(c, a, link),
+            Page::Wiki(c, u) => match &link.target {
+                Target::File { id } => {
+                    let (id, dir) = (id.clone(), self.wiki_dir(c, u));
+                    self.place_announcement_file(&id, dir, true)
+                }
+                _ => self.activate_link(c, "", link),
+            },
         }
     }
 
@@ -2559,6 +3038,23 @@ impl App {
                 None => vec![],
             };
         }
+        if let ViewKind::Modules { course_id, .. } = self.view().kind.clone() {
+            return match self.selected_module_row() {
+                Some(ModuleRow::Item(m, i)) if i.kind() == ItemKind::File => {
+                    match i.content().map(str::to_string) {
+                        Some(id) => {
+                            let module = m.name().to_string();
+                            self.place_module_file(&course_id, &module, &id, false, false)
+                        }
+                        None => vec![],
+                    }
+                }
+                _ => {
+                    self.notice = Some("That item is not a file.".into());
+                    vec![]
+                }
+            };
+        }
         let Some(page) = self.view().kind.page() else {
             return vec![];
         };
@@ -2567,7 +3063,9 @@ impl App {
                 let dir = self.page_dir(&page);
                 match page {
                     Page::Assignment(..) => self.place_from(&id, dir, false),
-                    Page::Announcement(..) => self.place_announcement_file(&id, dir, false),
+                    Page::Announcement(..) | Page::Wiki(..) => {
+                        self.place_announcement_file(&id, dir, false)
+                    }
                 }
             }
             Some(_) => {
@@ -2590,6 +3088,29 @@ impl App {
         } = self.view().kind.clone()
         {
             return self.download_folder(&course_id, &course_name, folder_id.as_deref());
+        }
+        if let ViewKind::Modules { course_id, .. } = self.view().kind.clone() {
+            let files: Vec<(String, String)> = self
+                .visible_rows()
+                .iter()
+                .filter_map(|&i| match self.module_rows(&course_id).get(i).copied() {
+                    Some(ModuleRow::Item(m, item)) if item.kind() == ItemKind::File => {
+                        Some((m.name().to_string(), item.content()?.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if files.is_empty() {
+                self.notice = Some("There are no files here.".into());
+                return vec![];
+            }
+            let count = files.len();
+            let mut effects = Vec::new();
+            for (module, id) in files {
+                effects.extend(self.place_module_file(&course_id, &module, &id, false, true));
+            }
+            self.notice = Some(format!("Checking {count} module files before downloading…"));
+            return effects;
         }
         let Some(page) = self.view().kind.page() else {
             return vec![];
@@ -2615,7 +3136,7 @@ impl App {
                 let batch = ids.into_iter().map(|id| (id, dir.clone())).collect();
                 self.download_batch(batch)
             }
-            Page::Announcement(..) => {
+            Page::Announcement(..) | Page::Wiki(..) => {
                 let mut effects = Vec::new();
                 for id in ids {
                     effects.extend(self.place_announcement_file(&id, Some(dir.clone()), false));
@@ -2655,6 +3176,21 @@ impl App {
                 };
                 saved.or_else(|| self.class_dir(&course_id, &course_name, folder_id.as_deref()))
             }
+            ViewKind::Modules {
+                course_id,
+                course_name,
+            } => {
+                let saved = match self.selected_module_row() {
+                    Some(ModuleRow::Item(_, i)) if i.kind() == ItemKind::File => {
+                        i.content().and_then(|id| self.saved_path(id))
+                    }
+                    _ => None,
+                };
+                saved.or_else(|| {
+                    let lib = self.library.as_ref()?;
+                    Some(lib.root().join(self.course_dir(&course_id, &course_name)))
+                })
+            }
             kind => {
                 let saved = match self.selected_link().map(|l| l.target) {
                     Some(Target::File { id }) => self.saved_path(&id),
@@ -2687,49 +3223,29 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Cycle course tabs; leaving Files leaves its nested folders.
+    /// Cycle the course sections Canvas shows; leaving Files leaves its
+    /// nested folders.
     fn switch_tab(&mut self, backwards: bool) -> Vec<Effect> {
-        let (course_id, course_name, index) = match &self.view().kind {
-            ViewKind::Assignments {
-                course_id,
-                course_name,
-            } => (course_id.clone(), course_name.clone(), 0),
-            ViewKind::Files {
-                course_id,
-                course_name,
-                ..
-            } => (course_id.clone(), course_name.clone(), 1),
-            ViewKind::Announcements {
-                course_id,
-                course_name,
-            } => (course_id.clone(), course_name.clone(), 2),
-            _ => return vec![],
+        let Some((tab, course_id, course_name)) = self
+            .view()
+            .kind
+            .tab()
+            .map(|(t, c, n)| (t, c.to_string(), n.to_string()))
+        else {
+            return vec![];
         };
-        let next = match (index + if backwards { 2 } else { 1 }) % 3 {
-            0 => ViewKind::Assignments {
-                course_id,
-                course_name,
-            },
-            1 => ViewKind::Files {
-                course_id,
-                course_name,
-                folder_id: None,
-            },
-            _ => ViewKind::Announcements {
-                course_id,
-                course_name,
-            },
+        let tabs = self.course_tabs(&course_id);
+        let Some(&first) = tabs.first() else {
+            return vec![];
         };
-        while self.stack.len() > 1
-            && matches!(
-                self.stack[self.stack.len() - 2].kind,
-                ViewKind::Files { .. }
-            )
-        {
-            self.stack.pop();
+        let next = match tabs.iter().position(|t| *t == tab) {
+            Some(i) => tabs[(i + if backwards { tabs.len() - 1 } else { 1 }) % tabs.len()],
+            None => first,
+        };
+        if next == tab {
+            return vec![];
         }
-        *self.view_mut() = View::new(next);
-        self.enter_current(false)
+        self.replace_tab(next.view(course_id, course_name))
     }
 
     fn reveal(&mut self, path: Option<PathBuf>) -> Vec<Effect> {
@@ -2846,6 +3362,187 @@ impl App {
         }
     }
 
+    /// Files and links in a wiki page.
+    pub fn wiki_links(&self, course_id: &str, url: &str) -> Vec<Link> {
+        self.wiki_pages
+            .get(&(course_id.to_string(), url.to_string()))
+            .and_then(|r| r.data.as_ref())
+            .and_then(|p| p.body.as_deref())
+            .map(|html| crate::html::links(html, &self.origin))
+            .unwrap_or_default()
+    }
+
+    /// Local folder for a wiki page's files.
+    pub fn wiki_dir(&self, course_id: &str, url: &str) -> Option<PathBuf> {
+        let lib = self.library.as_ref()?;
+        let title = self
+            .wiki_pages
+            .get(&(course_id.to_string(), url.to_string()))
+            .and_then(|r| r.data.as_ref())
+            .and_then(|p| p.title.clone())
+            .unwrap_or_else(|| url.to_string());
+        Some(
+            lib.root()
+                .join(self.course_dir(course_id, &self.course_title(course_id)))
+                .join("Page Files")
+                .join(library::safe_name(&title)),
+        )
+    }
+
+    /// A module item's Canvas page, kept on the Canvas origin. Opening an
+    /// item through its module page lets Canvas record a "view" requirement.
+    fn module_item_url(&self, course_id: &str, item: &crate::modules::Item) -> String {
+        item.html_url
+            .clone()
+            .filter(|u| u.starts_with(&format!("{}/", self.origin)))
+            .unwrap_or_else(|| {
+                if crate::model::valid_id(&item.id) {
+                    format!(
+                        "{}/courses/{course_id}/modules/items/{}",
+                        self.origin, item.id
+                    )
+                } else {
+                    format!("{}/courses/{course_id}/modules", self.origin)
+                }
+            })
+    }
+
+    /// `Enter` on a module item: assignments and pages open here, files go
+    /// to the library, everything else (quizzes, discussions, links, tools)
+    /// opens in the browser.
+    fn open_module_item(
+        &mut self,
+        course_id: &str,
+        course_name: &str,
+        module: &str,
+        item: crate::modules::Item,
+    ) -> Vec<Effect> {
+        let title = item.title().to_string();
+        let next = match (item.kind(), item.content(), item.page()) {
+            (ItemKind::Heading, ..) => return vec![],
+            (ItemKind::Assignment, Some(id), _) => ViewKind::Detail {
+                course_id: course_id.to_string(),
+                course_name: course_name.to_string(),
+                assignment_id: id.to_string(),
+                title,
+            },
+            (ItemKind::Page, _, Some(url)) => ViewKind::WikiPage {
+                course_id: course_id.to_string(),
+                course_name: course_name.to_string(),
+                page_url: url.to_string(),
+                title,
+            },
+            (ItemKind::File, Some(id), _) => {
+                let id = id.to_string();
+                return self.place_module_file(course_id, module, &id, true, false);
+            }
+            _ => return vec![Effect::OpenUrl(self.module_item_url(course_id, &item))],
+        };
+        self.stack.push(View::new(next));
+        self.enter_current(false)
+    }
+
+    /// Put a module file in the library. Module files are course files, so
+    /// they go in Class Files under their Canvas folder; when Files is hidden
+    /// the folder cannot be read, so they go in `Module Files/<module>`.
+    /// The file's details are always read fresh first.
+    fn place_module_file(
+        &mut self,
+        course_id: &str,
+        module: &str,
+        file_id: &str,
+        open: bool,
+        quiet: bool,
+    ) -> Vec<Effect> {
+        if self.library.is_none() {
+            if !quiet {
+                self.notice = Some("The file library is unavailable.".into());
+            }
+            return vec![];
+        }
+        self.module_waiting.insert(
+            file_id.to_string(),
+            ModuleFile {
+                course_id: course_id.to_string(),
+                module: module.to_string(),
+                open,
+                quiet,
+            },
+        );
+        let mut effects: Vec<Effect> = self
+            .request(ResourceKey::File(file_id.to_string()), false)
+            .into_iter()
+            .collect();
+        if self.course_tabs(course_id).contains(&CourseTab::Files) {
+            let key = ResourceKey::Files(course_id.to_string());
+            self.load_snapshot(&key);
+            let known = self
+                .course_files
+                .get(course_id)
+                .is_some_and(|r| r.data.is_some() || matches!(r.sync, SyncState::Syncing { .. }));
+            if !known {
+                effects.extend(self.request(key, false));
+            }
+        }
+        effects.extend(self.place_module_files());
+        effects
+    }
+
+    /// Place the module files whose details (and course folders) are in.
+    fn place_module_files(&mut self) -> Vec<Effect> {
+        let busy = |app: &App, key: ResourceKey| {
+            matches!(app.sync_of(&key), Some(SyncState::Syncing { .. }))
+        };
+        let ready: Vec<String> = self
+            .module_waiting
+            .iter()
+            .filter(|(id, m)| {
+                !busy(self, ResourceKey::File((*id).clone()))
+                    && !busy(self, ResourceKey::Files(m.course_id.clone()))
+                    && self.file_meta(id).is_some()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut effects = Vec::new();
+        for id in ready {
+            let Some(m) = self.module_waiting.remove(&id) else {
+                continue;
+            };
+            let Some(dir) = self.module_file_dir(&m.course_id, &m.module, &id) else {
+                continue;
+            };
+            effects.extend(self.place_file(
+                &id,
+                Intent {
+                    dir,
+                    open: m.open,
+                    automatic: false,
+                    quiet: m.quiet,
+                },
+            ));
+        }
+        effects
+    }
+
+    pub fn module_file_dir(&self, course_id: &str, module: &str, file_id: &str) -> Option<PathBuf> {
+        let name = self.course_title(course_id);
+        let folder = self.file_meta(file_id).and_then(|f| f.folder_id.clone());
+        if let Some(id) = folder.as_deref()
+            && self
+                .folder(course_id, id)
+                .is_some_and(|f| f.full_name.is_some())
+        {
+            return self.class_dir(course_id, &name, Some(id));
+        }
+        let lib = self.library.as_ref()?;
+        Some(
+            lib.root()
+                .join(self.course_dir(course_id, &name))
+                .join("Module Files")
+                .join(library::safe_name(module)),
+        )
+    }
+
     fn activate_link(&mut self, course_id: &str, assignment_id: &str, link: Link) -> Vec<Effect> {
         match link.target {
             Target::File { id } => {
@@ -2867,7 +3564,22 @@ impl App {
                 }));
                 self.enter_current(false)
             }
-            // Pages, modules, discussions, tools and outside sites open in the browser.
+            Target::Page { course_id, url } => {
+                let course_name = self.course_title(&course_id);
+                let title = if link.text.is_empty() {
+                    url.clone()
+                } else {
+                    link.text
+                };
+                self.stack.push(View::new(ViewKind::WikiPage {
+                    course_id,
+                    course_name,
+                    page_url: url,
+                    title,
+                }));
+                self.enter_current(false)
+            }
+            // Modules, discussions, tools and outside sites open in the browser.
             Target::Canvas | Target::Web | Target::Mail => vec![Effect::OpenUrl(link.url)],
         }
     }
@@ -2885,10 +3597,23 @@ impl App {
                 let Some(course) = self.courses.data.as_ref().and_then(|l| l.get(index)) else {
                     return vec![];
                 };
-                ViewKind::Assignments {
-                    course_id: course.id.clone(),
-                    course_name: course.title().to_string(),
-                }
+                let (id, title) = (course.id.clone(), course.title().to_string());
+                // Open where the saved tabs say, before Canvas is asked again.
+                self.load_snapshot(&ResourceKey::Tabs(id.clone()));
+                self.course_view(&id, &title)
+            }
+            ViewKind::Modules {
+                course_id,
+                course_name,
+            } => {
+                let (course_id, course_name) = (course_id.clone(), course_name.clone());
+                let Some(ModuleRow::Item(m, item)) =
+                    self.module_rows(&course_id).get(index).copied()
+                else {
+                    return vec![];
+                };
+                let (module, item) = (m.name().to_string(), item.clone());
+                return self.open_module_item(&course_id, &course_name, &module, item);
             }
             ViewKind::Announcements {
                 course_id,
@@ -2928,7 +3653,10 @@ impl App {
                     title: a.title().to_string(),
                 }
             }
-            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => return vec![],
+            ViewKind::Detail { .. }
+            | ViewKind::Announcement { .. }
+            | ViewKind::WikiPage { .. }
+            | ViewKind::CourseHome { .. } => return vec![],
             ViewKind::Files {
                 course_id,
                 course_name,
@@ -2966,6 +3694,31 @@ impl App {
     pub fn browser_url(&self) -> Option<String> {
         let same_origin = |u: &str| u.starts_with(&format!("{}/", self.origin));
         match &self.view().kind {
+            ViewKind::Modules { course_id, .. } => Some(match self.selected_module_row() {
+                Some(ModuleRow::Item(_, item)) => self.module_item_url(course_id, item),
+                _ => format!("{}/courses/{course_id}/modules", self.origin),
+            }),
+            ViewKind::WikiPage {
+                course_id,
+                page_url,
+                ..
+            } => {
+                if let Some(link) = self.selected_link() {
+                    return Some(link.url);
+                }
+                let html = self
+                    .wiki_pages
+                    .get(&(course_id.clone(), page_url.clone()))
+                    .and_then(|r| r.data.as_ref())
+                    .and_then(|p| p.html_url.clone())
+                    .filter(|u| same_origin(u));
+                Some(html.unwrap_or_else(|| {
+                    format!("{}/courses/{course_id}/pages/{page_url}", self.origin)
+                }))
+            }
+            ViewKind::CourseHome { course_id, .. } => {
+                Some(format!("{}/courses/{course_id}", self.origin))
+            }
             ViewKind::Announcements { course_id, .. } => {
                 let base = format!("{}/courses/{course_id}/announcements", self.origin);
                 let rows = self.visible_rows();
@@ -3727,9 +4480,9 @@ mod tests {
         });
         assert!(matches!(app.announcements["10"].sync, SyncState::Failed(_)));
         assert_eq!(app.visible_rows(), [0]);
-        // Forward wraps to Assignments; backward wraps to Announcements.
+        // Forward goes on to Modules; backward returns to Announcements.
         let effects = app.update(key(KeyCode::Tab));
-        assert_eq!(fetch_of(&effects).0, ResourceKey::Assignments("10".into()));
+        assert_eq!(fetch_of(&effects).0, ResourceKey::Modules("10".into()));
         let effects = app.update(key(KeyCode::BackTab));
         assert_eq!(
             fetch_of(&effects).0,
@@ -3745,6 +4498,7 @@ mod tests {
         let mut app = app_with_courses();
         app.store = Some(store.clone());
         app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::BackTab)); // Modules, last before Canvas's tabs are known
         let (k, r) = fetch_of(&app.update(key(KeyCode::BackTab)));
         let summary = crate::announcements::Summary {
             id: "8".into(),
@@ -3802,6 +4556,7 @@ mod tests {
         ] {
             let mut app = app_with_courses();
             app.update(key(KeyCode::Enter));
+            app.update(key(KeyCode::BackTab)); // Modules, last before Canvas's tabs are known
             let (k, r) = fetch_of(&app.update(key(KeyCode::BackTab)));
             let summary = crate::announcements::Summary {
                 id: "8".into(),
@@ -4208,5 +4963,305 @@ mod tests {
         assert!(app.update(key(KeyCode::Enter)).is_empty());
         assert!(app.notice.as_deref().unwrap().contains("locked"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- Course tabs and modules ----
+
+    fn tab(id: &str) -> crate::modules::Tab {
+        crate::modules::Tab {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    fn fetches(effects: &[Effect]) -> Vec<ResourceKey> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Fetch { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Deliver the read in flight for `key` and return what the app does next.
+    fn answer(app: &mut App, key: ResourceKey, payload: Payload) -> Vec<Effect> {
+        let request = match app.sync_of(&key) {
+            Some(SyncState::Syncing { request, .. }) => *request,
+            other => panic!("no read in flight for {key:?}: {other:?}"),
+        };
+        app.update(Msg::Fetched {
+            key,
+            request,
+            result: Ok((payload, FetchStats::default())),
+            at: Utc::now(),
+        })
+    }
+
+    fn tabs_key() -> ResourceKey {
+        ResourceKey::Tabs("10".into())
+    }
+
+    #[test]
+    fn course_tabs_follow_canvas_and_are_read_once_per_run() {
+        let mut app = app_with_courses();
+        let effects = app.update(key(KeyCode::Enter));
+        // Before Canvas's tabs are known the course opens on Assignments.
+        assert!(matches!(app.view().kind, ViewKind::Assignments { .. }));
+        assert!(fetches(&effects).contains(&tabs_key()));
+        let effects = answer(
+            &mut app,
+            tabs_key(),
+            Payload::Tabs(vec![tab("home"), tab("announcements"), tab("modules")]),
+        );
+        // Assignments is hidden on Canvas: the first section Canvas shows instead.
+        assert!(matches!(app.view().kind, ViewKind::Announcements { .. }));
+        assert_eq!(fetches(&effects), [ResourceKey::Announcements("10".into())]);
+        assert_eq!(
+            app.course_tabs("10"),
+            [CourseTab::Announcements, CourseTab::Modules]
+        );
+        // Tab cycles only what Canvas shows.
+        let effects = app.update(key(KeyCode::Tab));
+        assert_eq!(fetch_of(&effects).0, ResourceKey::Modules("10".into()));
+        app.update(key(KeyCode::Tab));
+        assert!(matches!(app.view().kind, ViewKind::Announcements { .. }));
+        // Coming back uses the tabs already read this run.
+        app.update(key(KeyCode::Esc));
+        let effects = app.update(key(KeyCode::Enter));
+        assert!(matches!(app.view().kind, ViewKind::Announcements { .. }));
+        assert!(!fetches(&effects).contains(&tabs_key()));
+        // `r` reads them again.
+        assert!(fetches(&app.update(key(KeyCode::Char('r')))).contains(&tabs_key()));
+    }
+
+    #[test]
+    fn saved_tabs_are_used_at_once_and_read_again_once_per_run() {
+        let root = std::env::temp_dir().join(format!("tuicanvas-tabs-{}", std::process::id()));
+        let store = Arc::new(SnapshotStore::new(&root, "reader"));
+        store.save(&tabs_key(), &vec![tab("files")], Utc::now());
+        let mut app = app_with_courses();
+        app.store = Some(store);
+        let effects = app.update(key(KeyCode::Enter));
+        assert!(matches!(app.view().kind, ViewKind::Files { .. }));
+        assert_eq!(
+            fetches(&effects),
+            [ResourceKey::Files("10".into()), tabs_key()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_modules_home_counts_as_shown_and_no_sections_leaves_the_course_page() {
+        let mut app = App::new(ORIGIN, None);
+        let (k, r) = fetch_of(&app.start());
+        let mut home = course("10", "GPU Computing");
+        home.default_view = Some("modules".into());
+        deliver(
+            &mut app,
+            k,
+            r,
+            Payload::Courses(vec![home, course("20", "Compilers")]),
+        );
+        app.update(key(KeyCode::Enter));
+        answer(&mut app, tabs_key(), Payload::Tabs(vec![tab("home")]));
+        assert!(matches!(app.view().kind, ViewKind::Modules { .. }));
+        assert!(!app.available(Act::NextSection));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        let other = ResourceKey::Tabs("20".into());
+        answer(
+            &mut app,
+            other.clone(),
+            Payload::Tabs(vec![tab("home"), tab("grades")]),
+        );
+        assert!(matches!(app.view().kind, ViewKind::CourseHome { .. }));
+        assert_eq!(app.browser_url().unwrap(), format!("{ORIGIN}/courses/20"));
+        // A refresh that finds a section shown again opens it.
+        assert_eq!(
+            fetches(&app.update(key(KeyCode::Char('r')))),
+            [other.clone()]
+        );
+        answer(&mut app, other, Payload::Tabs(vec![tab("files")]));
+        assert!(matches!(app.view().kind, ViewKind::Files { .. }));
+    }
+
+    const MODULES: &str = r#"[{"id":1,"name":"Week 1","state":"started","items":[
+        {"id":11,"type":"SubHeader","title":"Read first"},
+        {"id":12,"type":"Page","title":"Intro","page_url":"intro","completion_requirement":{"type":"must_view","completed":true}},
+        {"id":13,"type":"Assignment","title":"Lab 1","content_id":55,"indent":1},
+        {"id":14,"type":"File","title":"lecture1.pdf","content_id":101},
+        {"id":15,"type":"Quiz","title":"Quiz 1","content_id":4,"html_url":"https://ufl.instructure.com/courses/10/modules/items/15"},
+        {"id":16,"type":"ExternalUrl","title":"Reading","html_url":"https://example.com/x"}]},
+        {"id":2,"name":"Week 2","state":"locked","items":[]}]"#;
+
+    /// GPU Computing with Canvas showing `tabs`, on its Modules screen.
+    fn modules_app(tabs: &[&str], library: Option<Arc<Library>>) -> App {
+        let mut app = app_with_courses();
+        app.library = library;
+        app.update(key(KeyCode::Enter));
+        let list = tabs.iter().map(|t| tab(t)).collect();
+        answer(&mut app, tabs_key(), Payload::Tabs(list));
+        while !matches!(app.view().kind, ViewKind::Modules { .. }) {
+            app.update(key(KeyCode::Tab));
+        }
+        let modules = serde_json::from_str(MODULES).unwrap();
+        answer(
+            &mut app,
+            ResourceKey::Modules("10".into()),
+            Payload::Modules(modules),
+        );
+        app
+    }
+
+    fn download_target(effects: &[Effect]) -> PathBuf {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Download { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a download, got {effects:?}"))
+    }
+
+    #[test]
+    fn modules_list_skips_headings_and_opens_each_kind() {
+        let (library, root) = temp_library("modules");
+        let mut app = modules_app(&["assignments", "modules"], Some(library));
+        // Rows: Week 1, Read first, Intro, Lab 1, lecture1.pdf, Quiz 1, Reading, Week 2.
+        assert_eq!(app.view().selected, 2);
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.view().selected, 2);
+        app.update(key(KeyCode::End));
+        assert_eq!(app.view().selected, 6);
+        app.update(key(KeyCode::Home));
+        assert_eq!(app.view().selected, 2);
+
+        // Assignments open in the reader.
+        app.update(key(KeyCode::Down));
+        let effects = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            fetch_of(&effects).0,
+            ResourceKey::Detail("10".into(), "55".into())
+        );
+        app.update(key(KeyCode::Esc));
+
+        // Files is hidden, so a module file goes to Module Files/<module>.
+        app.update(key(KeyCode::Down));
+        assert!(app.available(Act::Download));
+        let effects = app.update(key(KeyCode::Enter));
+        assert_eq!(fetches(&effects), [ResourceKey::File("101".into())]);
+        let effects = deliver_file(&mut app, canvas_file("101", "lecture1.pdf", "3"));
+        assert!(
+            download_target(&effects).ends_with(
+                Path::new("GPU Computing")
+                    .join("Module Files")
+                    .join("Week 1")
+                    .join("lecture1.pdf")
+            )
+        );
+
+        // Quizzes open on Canvas; outside links go through their module item.
+        app.update(key(KeyCode::Down));
+        assert_eq!(
+            app.update(key(KeyCode::Enter)),
+            [Effect::OpenUrl(format!(
+                "{ORIGIN}/courses/10/modules/items/15"
+            ))]
+        );
+        app.update(key(KeyCode::Down));
+        assert_eq!(
+            app.browser_url().unwrap(),
+            format!("{ORIGIN}/courses/10/modules/items/16")
+        );
+
+        // Pages are read here, with their files and links.
+        app.update(key(KeyCode::Home));
+        let effects = app.update(key(KeyCode::Enter));
+        let page = ResourceKey::WikiPage("10".into(), "intro".into());
+        assert_eq!(fetch_of(&effects).0, page);
+        answer(
+            &mut app,
+            page,
+            Payload::WikiPage(Box::new(crate::modules::WikiPage {
+                title: Some("Intro".into()),
+                body: Some(
+                    r#"<p>See <a href="/courses/10/files/22">notes</a> and <a href="/courses/10/pages/week-2">next</a>.</p>"#.into(),
+                ),
+                ..Default::default()
+            })),
+        );
+        let links = app.current_links();
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[1].target,
+            Target::Page {
+                course_id: "10".into(),
+                url: "week-2".into()
+            }
+        );
+        assert!(
+            app.wiki_dir("10", "intro")
+                .unwrap()
+                .ends_with(Path::new("GPU Computing").join("Page Files").join("Intro"))
+        );
+        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::Down));
+        let effects = app.update(key(KeyCode::Enter));
+        assert_eq!(
+            fetch_of(&effects).0,
+            ResourceKey::WikiPage("10".into(), "week-2".into())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn module_files_mirror_their_canvas_folder_when_files_is_shown() {
+        let (library, root) = temp_library("module-folders");
+        let mut app = modules_app(&["modules", "files"], Some(library));
+        for _ in 0..2 {
+            app.update(key(KeyCode::Down));
+        }
+        let effects = app.update(key(KeyCode::Char('d')));
+        assert_eq!(
+            fetches(&effects),
+            [
+                ResourceKey::File("101".into()),
+                ResourceKey::Files("10".into())
+            ]
+        );
+        // The file's details alone are not enough while its folders are being read.
+        let effects = deliver_file(&mut app, canvas_file("101", "lecture1.pdf", "3"));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Download { .. })));
+        let effects = answer(
+            &mut app,
+            ResourceKey::Files("10".into()),
+            Payload::Files(Box::new(course_files())),
+        );
+        assert!(
+            download_target(&effects).ends_with(
+                Path::new("Class Files")
+                    .join("Lectures")
+                    .join("Week 1")
+                    .join("lecture1.pdf")
+            )
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn module_search_keeps_headings_of_matching_items() {
+        let mut app = modules_app(&["modules"], None);
+        app.update(key(KeyCode::Char('/')));
+        for c in "quiz".chars() {
+            app.update(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.visible_rows(), [0, 5]);
+        assert_eq!(app.view().selected, 1);
+        assert!(matches!(
+            app.selected_module_row(),
+            Some(ModuleRow::Item(_, i)) if i.title() == "Quiz 1"
+        ));
     }
 }

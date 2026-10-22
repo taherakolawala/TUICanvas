@@ -105,6 +105,20 @@ fn current_has_data(app: &App) -> bool {
             .announcement_details
             .get(&(course_id.clone(), announcement_id.clone()))
             .is_some_and(|r| r.data.is_some()),
+        ViewKind::Modules { course_id, .. } => {
+            app.modules.get(course_id).is_some_and(|r| r.data.is_some())
+        }
+        ViewKind::WikiPage {
+            course_id,
+            page_url,
+            ..
+        } => app
+            .wiki_pages
+            .get(&(course_id.clone(), page_url.clone()))
+            .is_some_and(|r| r.data.is_some()),
+        ViewKind::CourseHome { course_id, .. } => {
+            app.tabs.get(course_id).is_some_and(|r| r.data.is_some())
+        }
         ViewKind::Files { course_id, .. } => app
             .course_files
             .get(course_id)
@@ -196,7 +210,14 @@ fn find_row(app: &App, needle: &str) -> Option<usize> {
                 .get(course_id)
                 .and_then(|r| r.data.as_ref())
                 .is_some_and(|l| l[i].title().to_lowercase().contains(&needle)),
-            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => false,
+            ViewKind::Detail { .. }
+            | ViewKind::Announcement { .. }
+            | ViewKind::WikiPage { .. }
+            | ViewKind::CourseHome { .. } => false,
+            ViewKind::Modules { course_id, .. } => {
+                matches!(app.module_rows(course_id).get(i), Some(crate::app::ModuleRow::Item(_, it))
+                    if it.title().to_lowercase().contains(&needle))
+            }
             ViewKind::Announcements { course_id, .. } => app
                 .announcements
                 .get(course_id)
@@ -251,6 +272,23 @@ fn run_once<B: Backend>(
         effects,
         at,
     )?);
+
+    // A course opens on its first Canvas tab; the timed steps use Assignments.
+    for _ in 0..4 {
+        if matches!(app.view().kind, ViewKind::Assignments { .. }) {
+            break;
+        }
+        let effects = app.update(press(KeyCode::Tab));
+        step(
+            "switch tab",
+            terminal,
+            &mut app,
+            executor,
+            rx,
+            effects,
+            Instant::now(),
+        )?;
+    }
 
     // A purely local key: move the selection and back.
     let mut moves = Vec::new();

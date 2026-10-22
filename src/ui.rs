@@ -10,8 +10,8 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, DetailRender, FileRow, Local as LocalFile, Origin, Page, Resource, Section, SyncState,
-    ViewKind, human_size,
+    App, CourseTab, DetailRender, FileRow, Local as LocalFile, ModuleRow, Origin, Page, Resource,
+    Section, SyncState, ViewKind, human_size,
 };
 use crate::html::{self, Link, Target};
 use crate::keys;
@@ -253,25 +253,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         match app.view().kind.clone() {
             ViewKind::Courses => draw_home(frame, main, app, now),
-            ViewKind::Assignments { course_id, .. } => {
+            kind @ (ViewKind::Assignments { .. }
+            | ViewKind::Files { .. }
+            | ViewKind::Announcements { .. }
+            | ViewKind::Modules { .. }) => {
+                let (tab, course_id, _) = kind.tab().expect("a course tab");
+                let course_id = course_id.to_string();
                 let [tabs, body] =
                     Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-                draw_tabs(frame, tabs, 0);
-                draw_assignments(frame, body, app, &course_id, now)
+                draw_tabs(frame, tabs, &app.course_tabs(&course_id), Some(tab));
+                match tab {
+                    CourseTab::Assignments => draw_assignments(frame, body, app, &course_id, now),
+                    CourseTab::Files => draw_files(frame, body, app, &course_id, now),
+                    CourseTab::Announcements => {
+                        draw_announcements(frame, body, app, &course_id, now)
+                    }
+                    CourseTab::Modules => draw_modules(frame, body, app, &course_id, now),
+                }
             }
-            ViewKind::Files { course_id, .. } => {
+            ViewKind::CourseHome { course_id, .. } => {
                 let [tabs, body] =
                     Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-                draw_tabs(frame, tabs, 1);
-                draw_files(frame, body, app, &course_id, now)
+                draw_tabs(frame, tabs, &app.course_tabs(&course_id), None);
+                let text = vec![
+                    Line::raw(""),
+                    Line::styled(
+                        "Canvas shows none of the sections TUICanvas has for this course.",
+                        theme::muted(),
+                    ),
+                    Line::styled("Press o to open the course in the browser.", theme::muted()),
+                ];
+                frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), body);
             }
-            ViewKind::Announcements { course_id, .. } => {
-                let [tabs, body] =
-                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-                draw_tabs(frame, tabs, 2);
-                draw_announcements(frame, body, app, &course_id, now);
-            }
-            ViewKind::Announcement { course_name, .. } | ViewKind::Detail { course_name, .. } => {
+            ViewKind::Announcement { course_name, .. }
+            | ViewKind::Detail { course_name, .. }
+            | ViewKind::WikiPage { course_name, .. } => {
                 let page = app.view().kind.page().expect("a page view");
                 draw_page(frame, main, app, &page, &course_name, now)
             }
@@ -380,6 +396,35 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
                 app.spinner,
                 now,
             )
+        }
+        ViewKind::Modules {
+            course_id,
+            course_name,
+        } => {
+            crumbs.push(course_name.clone());
+            crumbs.push("Modules".into());
+            sync_text(app.modules.get(course_id), app.spinner, now)
+        }
+        ViewKind::WikiPage {
+            course_id,
+            course_name,
+            page_url,
+            title,
+        } => {
+            crumbs.push(course_name.clone());
+            crumbs.push(title.clone());
+            sync_text(
+                app.wiki_pages.get(&(course_id.clone(), page_url.clone())),
+                app.spinner,
+                now,
+            )
+        }
+        ViewKind::CourseHome {
+            course_id,
+            course_name,
+        } => {
+            crumbs.push(course_name.clone());
+            sync_text(app.tabs.get(course_id), app.spinner, now)
         }
         ViewKind::Files {
             course_id,
@@ -1115,29 +1160,138 @@ fn draw_announcements(
     );
 }
 
-/// `Assignments  Files` for a course, the current one highlighted.
-fn draw_tabs(frame: &mut Frame, area: Rect, active: usize) {
-    let tab = |label: &str, on: bool| {
-        Span::styled(
-            label.to_string(),
-            if on {
+/// The course sections Canvas shows, the current one highlighted.
+fn draw_tabs(frame: &mut Frame, area: Rect, tabs: &[CourseTab], active: Option<CourseTab>) {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, tab) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", theme::faint()));
+        }
+        spans.push(Span::styled(
+            tab.label(),
+            if Some(*tab) == active {
                 theme::tab_active()
             } else {
                 theme::muted()
             },
-        )
-    };
-    let spans = vec![
-        Span::raw(" "),
-        tab("Assignments", active == 0),
-        Span::styled(" │ ", theme::faint()),
-        tab("Files", active == 1),
-        Span::styled(" │ ", theme::faint()),
-        tab("Announcements", active == 2),
-        Span::styled("   Tab", theme::key()),
-        Span::styled(" switch", theme::faint()),
-    ];
+        ));
+    }
+    if tabs.len() > 1 {
+        spans.push(Span::styled("   Tab", theme::key()));
+        spans.push(Span::styled(" switch", theme::faint()));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// How far along a module is, from Canvas's module state.
+fn module_state(m: &crate::modules::Module, now: DateTime<Utc>) -> (String, Style) {
+    match m.state.as_deref() {
+        Some("completed") => ("Completed".into(), theme::tone(Tone::Good)),
+        Some("started") => ("In progress".into(), theme::tone(Tone::Info)),
+        Some("locked") => match m.unlock_at.filter(|at| *at > now) {
+            Some(at) => (
+                format!("Locked until {}", short_date(at, now)),
+                theme::failed(),
+            ),
+            None => ("Locked".into(), theme::failed()),
+        },
+        _ => (String::new(), theme::muted()),
+    }
+}
+
+/// Modules as one list: each module's name as a heading, then its items.
+fn draw_modules(frame: &mut Frame, area: Rect, app: &mut App, course_id: &str, now: DateTime<Utc>) {
+    if placeholder(frame, area, app.modules.get(course_id), "modules") {
+        return;
+    }
+    let rows = app.visible_rows();
+    if rows.is_empty() {
+        empty_message(frame, area, &app.view().filter, "modules");
+        return;
+    }
+    let (start, end) = window(app, rows.len(), usize::from(area.height.saturating_sub(1)));
+    let selected = app.view().selected;
+    let all = app.module_rows(course_id);
+    let wide = area.width >= 90;
+    let built: Vec<Row> = rows[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, &index)| {
+            let row = match all[index] {
+                ModuleRow::Module(m) => {
+                    let (state, style) = module_state(m, now);
+                    let mut name = html::sanitize(m.name());
+                    if m.require_sequential_progress == Some(true) {
+                        name.push_str("  (in order)");
+                    }
+                    Row::new(vec![
+                        Cell::from(Line::styled(name, theme::heading())),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(state).style(style),
+                    ])
+                }
+                ModuleRow::Item(_, item) => {
+                    let indent = "  ".repeat(item.indent.unwrap_or(0).min(5) as usize + 1);
+                    let title = html::sanitize(item.title());
+                    if item.kind() == crate::modules::ItemKind::Heading {
+                        Row::new(vec![
+                            Cell::from(Line::styled(format!("{indent}{title}"), theme::bold())),
+                            Cell::from(""),
+                            Cell::from(""),
+                            Cell::from(""),
+                        ])
+                    } else {
+                        let (state, style) = match (item.locked(), item.requirement()) {
+                            (true, _) => ("Locked".to_string(), theme::failed()),
+                            (_, Some((_, true))) => ("Done".to_string(), theme::tone(Tone::Good)),
+                            (_, Some((what, false))) => {
+                                (format!("To do: {what}"), theme::tone(Tone::Info))
+                            }
+                            _ => (String::new(), theme::muted()),
+                        };
+                        let due = item.due();
+                        let finished = matches!(item.requirement(), Some((_, true)));
+                        Row::new(vec![
+                            Cell::from(Line::from(vec![
+                                Span::raw(indent),
+                                Span::styled(format!("{:<4} ", item.label()), theme::code()),
+                                Span::raw(title),
+                            ])),
+                            Cell::from(due.map(|d| short_date(d, now)).unwrap_or_default())
+                                .style(theme::due(due, finished, now)),
+                            Cell::from(
+                                item.content_details
+                                    .as_ref()
+                                    .and_then(|d| d.points_possible)
+                                    .map(|p| format!("{} pts", fmt_num(p)))
+                                    .unwrap_or_default(),
+                            )
+                            .style(theme::muted()),
+                            Cell::from(state).style(style),
+                        ])
+                    }
+                }
+            };
+            if start + i == selected {
+                row.style(theme::selected())
+            } else {
+                row
+            }
+        })
+        .collect();
+    let widths = [
+        Constraint::Fill(1),
+        Constraint::Length(if area.width >= 70 { 20 } else { 0 }),
+        Constraint::Length(if wide { 8 } else { 0 }),
+        Constraint::Length(18),
+    ];
+    frame.render_widget(
+        Table::new(built, widths)
+            .header(Row::new(["Module", "Due", "Points", "Status"]).style(theme::table_header()))
+            .column_spacing(1),
+        area,
+    );
 }
 
 fn parse_time(text: Option<&str>) -> Option<DateTime<Utc>> {
@@ -1339,7 +1493,12 @@ fn link_row(app: &App, link: &Link) -> (String, String, String, (String, Style))
             let state = match (meta, app.files.get(id).map(|r| &r.sync)) {
                 (Some(f), _) => local_text(&app.local_state(f)),
                 (None, Some(SyncState::Failed(_))) => ("no access".into(), theme::error()),
-                (None, None) if matches!(app.view().kind, ViewKind::Announcement { .. }) => {
+                (None, None)
+                    if matches!(
+                        app.view().kind,
+                        ViewKind::Announcement { .. } | ViewKind::WikiPage { .. }
+                    ) =>
+                {
                     ("on demand".into(), theme::faint())
                 }
                 (None, _) => ("…".into(), theme::faint()),
@@ -1349,6 +1508,16 @@ fn link_row(app: &App, link: &Link) -> (String, String, String, (String, Style))
         Target::Assignment { .. } => (
             "ASGN".into(),
             link.text.clone(),
+            String::new(),
+            ("opens here".into(), theme::faint()),
+        ),
+        Target::Page { url, .. } => (
+            "PAGE".into(),
+            if link.text.is_empty() {
+                url.clone()
+            } else {
+                link.text.clone()
+            },
             String::new(),
             ("opens here".into(), theme::faint()),
         ),
@@ -1627,6 +1796,7 @@ fn page_body<'a>(app: &'a App, page: &Page) -> &'a [String] {
     let render = match page {
         Page::Assignment(..) => app.detail_render.as_ref(),
         Page::Announcement(..) => app.announcement_render.as_ref(),
+        Page::Wiki(..) => app.wiki_render.as_ref(),
     };
     render.map(|r| r.lines.as_slice()).unwrap_or(&[])
 }
@@ -1956,6 +2126,52 @@ fn draw_page(
                 .expect("checked");
             (announcement_header(app, c, detail, course), "(No message)")
         }
+        Page::Wiki(c, u) => {
+            let key = (c.clone(), u.clone());
+            if placeholder(frame, area, app.wiki_pages.get(&key), "page") {
+                return;
+            }
+            let res = &app.wiki_pages[&key];
+            let stale = !matches!(&app.wiki_render, Some(r)
+                if r.key == key && r.version == res.version && r.width == text_width);
+            if stale {
+                let lines = html::render(
+                    res.data
+                        .as_ref()
+                        .and_then(|p| p.body.as_deref())
+                        .unwrap_or(""),
+                    width,
+                    &app.origin,
+                );
+                app.wiki_render = Some(DetailRender {
+                    key: key.clone(),
+                    version: res.version,
+                    width: text_width,
+                    lines,
+                });
+            }
+            let page = app.wiki_pages[&key].data.as_ref().expect("checked");
+            let mut header = vec![
+                Line::styled(html::sanitize(page.title()), theme::tab_active()),
+                Line::styled(html::sanitize(course), theme::muted()),
+            ];
+            if let Some(at) = page.updated_at {
+                header.push(Line::raw(format!("Updated {}", long_date(at))));
+            }
+            if page.locked_for_user == Some(true) {
+                header.push(Line::styled(
+                    html::sanitize(
+                        page.lock_explanation
+                            .as_deref()
+                            .map(|e| html::render(e, 200, "").join(" "))
+                            .as_deref()
+                            .unwrap_or("This page is locked."),
+                    ),
+                    theme::failed(),
+                ));
+            }
+            (header, "(This page is empty)")
+        }
     };
     let focus = app.focus();
     let (selected_link, selected_attempt) = (app.view().link, app.view().attempt);
@@ -2264,6 +2480,7 @@ mod tests {
         );
         let effects = send(&mut app, KeyCode::Enter);
         deliver(&mut app, effects, Payload::Assignments(vec![]));
+        send(&mut app, KeyCode::BackTab); // Modules, last before Canvas's tabs are known
         let effects = send(&mut app, KeyCode::BackTab);
         let base = crate::announcements::Summary {
             id: "7".into(),
@@ -2433,6 +2650,105 @@ mod tests {
                 .contains("Space actions  ? help"),
             "{footer}"
         );
+    }
+
+    #[test]
+    fn modules_render_as_one_list_and_pages_and_empty_courses_explain_themselves() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        let tab = |id: &str| crate::modules::Tab {
+            id: id.into(),
+            ..Default::default()
+        };
+        app.tabs.insert(
+            "10".into(),
+            Resource {
+                data: Some(vec![tab("modules"), tab("announcements")]),
+                ..Default::default()
+            },
+        );
+        app.stack.push(crate::app::View::new(ViewKind::Modules {
+            course_id: "10".into(),
+            course_name: "GPU Computing".into(),
+        }));
+        let modules = serde_json::from_str(
+            r#"[{"id":1,"name":"Week 1","state":"started","items":[
+                {"id":11,"type":"SubHeader","title":"Read first"},
+                {"id":12,"type":"Page","title":"Intro","page_url":"intro","completion_requirement":{"type":"must_view","completed":true}},
+                {"id":13,"type":"Assignment","title":"Lab 1","content_id":55,"indent":1,
+                 "completion_requirement":{"type":"must_submit","completed":false},
+                 "content_details":{"due_at":"2030-01-01T05:00:00Z","points_possible":10}},
+                {"id":15,"type":"Quiz","title":"Quiz 1","content_details":{"locked_for_user":true}}]},
+                {"id":2,"name":"Week 2","state":"locked","items":[]}]"#,
+        )
+        .unwrap();
+        app.modules.insert(
+            "10".into(),
+            Resource {
+                data: Some(modules),
+                origin: Origin::Network,
+                ..Default::default()
+            },
+        );
+        let rendered = screen(&mut app, 110, 14);
+        println!("{rendered}\n");
+        for text in [
+            "Modules │ Announcements",
+            "Week 1",
+            "In progress",
+            "Read first",
+            "PAGE Intro",
+            "Done",
+            "ASGN Lab 1",
+            "To do: submit",
+            "10 pts",
+            "QUIZ Quiz 1",
+            "Locked",
+        ] {
+            assert!(rendered.contains(text), "missing {text}");
+        }
+        let _ = screen(&mut app, 40, 8);
+
+        app.stack.push(crate::app::View::new(ViewKind::WikiPage {
+            course_id: "10".into(),
+            course_name: "GPU Computing".into(),
+            page_url: "intro".into(),
+            title: "Intro".into(),
+        }));
+        app.wiki_pages.insert(
+            ("10".into(), "intro".into()),
+            Resource {
+                data: Some(crate::modules::WikiPage {
+                    title: Some("Intro".into()),
+                    body: Some(
+                        r#"<p>Welcome. Read <a href="/courses/10/pages/week-2">week 2</a>.</p>"#
+                            .into(),
+                    ),
+                    ..Default::default()
+                }),
+                origin: Origin::Network,
+                ..Default::default()
+            },
+        );
+        let rendered = screen(&mut app, 90, 14);
+        println!("{rendered}\n");
+        assert!(rendered.contains("Welcome."));
+        assert!(rendered.contains("Files & links (1)"));
+        assert!(rendered.contains("PAGE week 2"));
+        assert!(rendered.contains("opens here"));
+
+        app.stack.push(crate::app::View::new(ViewKind::CourseHome {
+            course_id: "20".into(),
+            course_name: "Seminar".into(),
+        }));
+        app.tabs.insert(
+            "20".into(),
+            Resource {
+                data: Some(vec![tab("home")]),
+                ..Default::default()
+            },
+        );
+        let rendered = screen(&mut app, 90, 10);
+        assert!(rendered.contains("Canvas shows none of the sections"));
     }
 
     #[test]
@@ -2948,6 +3264,7 @@ mod preview {
             term: term.clone(),
             is_favorite: Some(fav),
             access_restricted_by_date: None,
+            default_view: None,
         };
         deliver(
             &mut app,

@@ -14,6 +14,7 @@ mod html;
 mod keys;
 mod library;
 mod model;
+mod modules;
 mod procstats;
 mod protect;
 mod session;

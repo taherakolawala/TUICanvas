@@ -24,6 +24,12 @@ pub enum ResourceKey {
     Files(String),
     /// One Canvas file's metadata.
     File(String),
+    /// The course tabs Canvas shows the student (read once per run).
+    Tabs(String),
+    /// A course's modules with their items.
+    Modules(String),
+    /// A course wiki page, by its URL name.
+    WikiPage(String, String),
 }
 
 impl ResourceKey {
@@ -50,6 +56,11 @@ impl ResourceKey {
             ResourceKey::History(..) => return None,
             ResourceKey::Files(c) if ok(c) => format!("files-{}", c.replace('~', "_")),
             ResourceKey::File(f) if ok(f) => format!("file-{}", f.replace('~', "_")),
+            ResourceKey::Tabs(c) if ok(c) => format!("tabs-{}", c.replace('~', "_")),
+            ResourceKey::Modules(c) if ok(c) => format!("modules-{}", c.replace('~', "_")),
+            ResourceKey::WikiPage(c, u) if ok(c) && crate::modules::valid_slug(u) => {
+                format!("page-{}-{u}", c.replace('~', "_"))
+            }
             _ => return None,
         };
         Some(name + ".json")
@@ -67,6 +78,9 @@ impl ResourceKey {
             ResourceKey::History(..) => "submission history",
             ResourceKey::Files(_) => "files",
             ResourceKey::File(_) => "file",
+            ResourceKey::Tabs(_) => "course tabs",
+            ResourceKey::Modules(_) => "modules",
+            ResourceKey::WikiPage(..) => "page",
         }
     }
 }

@@ -41,6 +41,9 @@ pub struct Course {
     pub is_favorite: Option<bool>,
     #[serde(default)]
     pub access_restricted_by_date: Option<bool>,
+    /// The course home: `modules`, `assignments`, `wiki`, `feed` or `syllabus`.
+    #[serde(default)]
+    pub default_view: Option<String>,
 }
 
 impl Course {
@@ -252,7 +255,7 @@ pub struct CanvasFolder {
     pub hidden_for_user: Option<bool>,
 }
 
-fn de_opt_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+pub(crate) fn de_opt_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Id {

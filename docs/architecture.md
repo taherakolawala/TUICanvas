@@ -139,6 +139,7 @@ stateDiagram-v2
 - **Two-second reuse.** If an equivalent read started less than 2 seconds ago is still in flight, it satisfies the new access instead of being duplicated. An older in-flight read does not.
 - **Latest wins.** Each read carries a request id, and a response is applied only if its id is still the newest for that resource. A slow older response can never overwrite newer data.
 - **Failures never hide.** A failed read leaves the previous data on screen, marked **Outdated** with the reason.
+- **One exception: course tabs.** Which tabs a course shows changes rarely, so the saved list is used at once and read from Canvas once per run and on `r`, not on every visit.
 - **Sign-in.**
   - An expired session found at startup opens sign-in directly.
   - One that expires mid-session shows a banner and waits for `L`.
@@ -363,3 +364,11 @@ Sizes are of the decompressed JSON bodies. Timings come from `tuicanvas --smoke`
 `announcements.rs` owns the typed list/detail models and request policy. It fetches the selected course's metadata using paginated GraphQL, then sorts by posting time (delayed/creation dates as fallbacks); a single REST read loads an opened announcement's body and attachments. A schema rejection permits the REST list fallback, while network/auth/pagination failures remain visible.
 
 The tab and detail use distinct `ResourceKey` variants, so snapshots, request generations, Syncing/Outdated states and rendering caches stay separate from assignments. Only visible list rows are rendered, and message HTML is wrapped once per version and width. Links share the existing Canvas file library and assignment navigation; file metadata and downloads are requested only when a file is chosen. Announcement read status combines Canvas state with account-scoped local reading history. Opening a readable detail records its course/topic ID separately from snapshots; fresh server responses cannot erase this local Read indicator. No read-status writes are sent to Canvas.
+
+## Course tabs, modules and pages
+
+`modules.rs` reads three things. `/api/v1/courses/:id/tabs` lists the tabs Canvas shows the student; hidden tabs are left out by Canvas (and any marked hidden are dropped), so the reader shows a course section only when its tab is listed. The course's `default_view` (its Canvas home) also counts: a course whose home is Modules or Assignments shows that section first even with its tab hidden, as Canvas does. `App::course_tabs` turns this into the sections in Canvas's order; before the tabs are known (first visit, no saved copy) all four are offered and the view moves to the first shown one when the read arrives. When a read finds the current section hidden, the view is replaced by the first shown section, or by a course screen saying nothing is shown.
+
+`/api/v1/courses/:id/modules?include[]=items&include[]=content_details` returns modules with their items; a module whose items Canvas leaves out is read separately. The Modules screen is one flat list of module headings and items (`ModuleRow`); headings are not selectable. Item ids, content ids and page URL names are validated before they are put into a request path or file name (`valid_slug`). `/api/v1/courses/:id/pages/:url` reads one page; its key, snapshot and render cache are separate, and page links in any HTML (`/courses/:id/pages/:url`) classify as `Target::Page` and open in the reader.
+
+A module file is placed after a fresh read of its details. When Files is shown the course's folder list is read too (or its saved copy used) so the file lands in `Class Files` under its Canvas folder; when Files is hidden the folder read would fail with 403, so the file goes to `Module Files/<module>`. Nothing is written to Canvas: module progress is not marked from the reader.

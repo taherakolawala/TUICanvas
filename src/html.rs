@@ -213,7 +213,12 @@ pub enum Target {
         course_id: String,
         id: String,
     },
-    /// Other Canvas content (pages, modules, quizzes, tools); opens in the browser.
+    /// A course wiki page; opens in the reader.
+    Page {
+        course_id: String,
+        url: String,
+    },
+    /// Other Canvas content (modules, quizzes, discussions, tools); opens in the browser.
     Canvas,
     /// Outside Canvas; opens in the browser.
     Web,
@@ -337,6 +342,17 @@ pub fn classify(url: &str, origin: &str) -> Target {
     if let Some(id) = number_after(path, "/files/") {
         return Target::File { id: id.to_string() };
     }
+    if let Some(course) = number_after(path, "/courses/")
+        && let Some(slug) = path
+            .strip_prefix(&format!("/courses/{course}/pages/"))
+            .map(|rest| rest.trim_end_matches('/'))
+            .filter(|slug| crate::modules::valid_slug(slug))
+    {
+        return Target::Page {
+            course_id: course.to_string(),
+            url: slug.to_string(),
+        };
+    }
     if let (Some(course), Some(id)) = (
         number_after(path, "/courses/"),
         number_after(path, "/assignments/"),
@@ -442,6 +458,33 @@ mod tests {
                 .iter()
                 .all(|l| unicode_width::UnicodeWidthStr::width(l.as_str()) <= 60
                     || l.contains("http"))
+        );
+    }
+
+    #[test]
+    fn course_pages_open_in_the_reader() {
+        let origin = "https://ufl.instructure.com";
+        assert_eq!(
+            classify(
+                &format!("{origin}/courses/5/pages/week-1-notes?module_item_id=3"),
+                origin
+            ),
+            Target::Page {
+                course_id: "5".into(),
+                url: "week-1-notes".into()
+            }
+        );
+        assert_eq!(
+            classify(&format!("{origin}/courses/5/pages"), origin),
+            Target::Canvas
+        );
+        assert_eq!(
+            classify(&format!("{origin}/courses/5/pages/a/b"), origin),
+            Target::Canvas
+        );
+        assert_eq!(
+            classify("https://other.edu/courses/5/pages/x", origin),
+            Target::Web
         );
     }
 
