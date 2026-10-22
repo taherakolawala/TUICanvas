@@ -74,6 +74,7 @@ flowchart LR
 | File library | `src/library.rs` | The folder tree under `%USERPROFILE%\TUICanvas`, Windows-safe names, one stored copy per Canvas file shown in several places through hard links, an index of versions and last use, and the 30-day clean-up of automatic image downloads |
 | Downloads | `src/download.rs` | Follows Canvas's redirects by hand: cookies only to the Canvas origin, then only to Canvas's two storage domains over HTTPS. Streams to a partial file, checks the length, 2 GB cap. |
 | Saved copies | `src/cache.rs` | Versioned JSON snapshots per Canvas origin and account, written atomically |
+| Keyboard | `src/keys.rs` | Every action declared once: its keys, the screens it applies to, its hint-line label and its letter in the actions menu. Key handling, the hint line, the `?` help screen and the `Space` menu are all generated from it. |
 | App state | `src/app.rs` | Pure state machine. Messages in (keys, fetch results, download progress, ticks); effects out (fetch, download, open a file, show a folder, open URL, sign in). Owns navigation, filtering, freshness rules and where each file goes. |
 | Runtime | `src/tui.rs` | Terminal setup and restore, input thread, async executor and download slots, sign-in handoff, opening files and folders, headless `--dump` mode |
 | Rendering | `src/ui.rs`, `src/theme.rs`, `src/html.rs` | Screens, the Assignments/Files tabs, the files & links list, colours, description HTML to terminal text with links numbered to match the list |
@@ -215,6 +216,26 @@ Details that matter:
 - **Completion is checked natively.** The helper confirms sign-in with a direct API read, not by looking for something on the Canvas page, because Canvas changes its pages.
 - **What gets saved.** The whole Playwright storage state, so UF and Duo cookies survive for the next browser login. The reader only ever sends cookies that belong to Canvas.
 
+## Keyboard
+
+All keys are declared in one table, `src/keys.rs`. Each row names an action, its keys, the scopes it applies in (for example the course list, a list inside a course, a page, the focused files & links section, a text box), a short hint label, a title, and optionally a letter in the actions menu.
+
+```mermaid
+flowchart LR
+    table[("keys.rs<br/>one row per action")]
+    press["Key press"] --> lookup["Look up the key in<br/>the active scopes"]
+    table --> lookup
+    lookup --> act["App::perform(action)"]
+    table --> hints["Hint line<br/>(the most useful keys that fit)"]
+    table --> menu["Space menu<br/>(letters, / search)"]
+    table --> help["? help<br/>(every key here)"]
+```
+
+- **One meaning per key.** `↑↓` move, `Enter` open, `Esc` back, `Tab` next tab or section, `/` search, `r` refresh, `o` browser, `Space` actions, `?` help and `q` quit mean the same wherever they work. Text boxes are the exception: letters are text there, and `Tab` completes a path.
+- **The actions menu** lists what applies to the selection and the screen, grouped, each with the letter that runs it; `/` searches it. Rare actions (hide a course, show hidden courses, open the TUICanvas folder, sign in again) are only in the menu, so they take no key of their own.
+- **Pages have sections, not modes.** An assignment or announcement is one scrolling page: details, text, files & links, and (assignments) past submissions. `Tab` moves the focus between sections; `↑↓` then act on the focused one; `Esc` returns to the text.
+- **Checked by tests.** No key may do two things in one place; core keys may not change meaning; menu letters are unique on every screen; every action can be triggered; the hint line fits 80 columns and always ends with `Space actions` and `? help`.
+
 ## Files and the local library
 
 Course files live in an ordinary folder you can browse in File Explorer:
@@ -229,7 +250,7 @@ C:\Users\<you>\TUICanvas\
 └── .tuicanvas\                   index (versions, paths, last use) and partial downloads
 ```
 
-- **Where you find files.** Each course has two tabs, **Assignments** and **Files** (`Tab` switches). Files shows the course's folders as Canvas has them; one listing read covers the whole course, so moving between folders and searching (`/`, across all folders) needs no further reads. Each assignment has a **Files & links** list under its description, numbered like the links in the text.
+- **Where you find files.** Each course has tabs for **Assignments**, **Files** and **Announcements** (`Tab` switches). Files shows the course's folders as Canvas has them; one listing read covers the whole course, so moving between folders and searching (`/`, across all folders) needs no further reads. Each assignment has a **Files & links** list under its description, numbered like the links in the text.
 - **When files download.**
   - When you open one (`Enter`, then it opens in its default app), or ask for it (`d`, or `D` for everything in a folder or assignment).
   - Images in an assignment's description download automatically when the assignment is read, so they open instantly later. They are removed after 30 days without use, unless you opened or downloaded them yourself.
