@@ -126,6 +126,8 @@ pub struct AssignmentDetail {
     #[serde(default)]
     pub allowed_attempts: Option<i64>,
     #[serde(default)]
+    pub allowed_extensions: Vec<String>,
+    #[serde(default)]
     pub grading_type: Option<String>,
 }
 

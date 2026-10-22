@@ -1,4 +1,4 @@
-//! Authenticated read-only Canvas client: cookies, CSRF, pagination, and
+//! Authenticated Canvas client: cookies, CSRF, pagination, uploads, and
 //! classification of authentication versus access failures.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -153,6 +153,7 @@ impl CanvasClient {
         path: &str,
         body: Option<Vec<u8>>,
         send_csrf: bool,
+        content_type: &'static str,
     ) -> Result<HttpResponse, CanvasError> {
         Self::check_path(path)?;
         let mut attempt = 0;
@@ -184,7 +185,7 @@ impl CanvasClient {
                 headers.push(("x-csrf-token", token));
             }
             if body.is_some() {
-                headers.push(("content-type", "application/json".to_string()));
+                headers.push(("content-type", content_type.to_string()));
             }
             let request = HttpRequest {
                 method,
@@ -215,9 +216,9 @@ impl CanvasClient {
             };
             self.absorb_cookies(path, &response);
             let verdict = match classify(&response) {
-                // Canvas answers a missing/invalid CSRF token on a POST with a bare
-                // 422 "An error occurred."; our only POSTs are read-only GraphQL.
-                Err(CanvasError::Http(422)) if method == Method::Post => Err(CanvasError::Csrf),
+                // GraphQL's bare 422 is a CSRF failure. A submission's 422 may
+                // instead mean invalid files or a closed assignment.
+                Err(CanvasError::Http(422)) if path == "/api/graphql" => Err(CanvasError::Csrf),
                 other => other,
             };
             self.diag.record(Exchange {
@@ -269,7 +270,7 @@ impl CanvasClient {
         path: &str,
     ) -> Result<(T, FetchStats), CanvasError> {
         let started = Instant::now();
-        let response = self.exchange(Method::Get, path, None, false).await?;
+        let response = self.exchange(Method::Get, path, None, false, "").await?;
         let network_ms = elapsed_ms(started);
         let parse_started = Instant::now();
         let value = parse_json(&response.body)?;
@@ -283,6 +284,170 @@ impl CanvasClient {
                 parse_ms: elapsed_ms(parse_started),
             },
         ))
+    }
+
+    pub async fn post_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        value: &Value,
+    ) -> Result<T, CanvasError> {
+        let body = serde_json::to_vec(value)
+            .map_err(|_| CanvasError::Invalid("could not encode request"))?;
+        let response = self
+            .exchange(Method::Post, path, Some(body), true, "application/json")
+            .await?;
+        parse_json(&response.body)
+    }
+
+    pub async fn post_form<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<T, CanvasError> {
+        let body = fields
+            .iter()
+            .map(|(key, value)| format!("{}={}", form_component(key), form_component(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes();
+        let response = self
+            .exchange(
+                Method::Post,
+                path,
+                Some(body),
+                true,
+                "application/x-www-form-urlencoded",
+            )
+            .await?;
+        parse_json(&response.body)
+    }
+
+    /// Second step of Canvas's signed upload. The signed host gets neither the
+    /// Canvas cookies nor the CSRF token; redirects are handled explicitly.
+    pub async fn upload_signed(
+        &self,
+        url: &str,
+        params: &serde_json::Map<String, Value>,
+        path: &std::path::Path,
+        expected_size: u64,
+    ) -> Result<Value, CanvasError> {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|_| CanvasError::Invalid("invalid upload URL"))?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(CanvasError::Invalid("unsafe upload URL"));
+        }
+        let boundary = format!(
+            "tuicanvas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        );
+        let mut prefix = Vec::new();
+        for (key, value) in params {
+            let Some(value) = value.as_str() else {
+                return Err(CanvasError::Invalid("invalid upload parameter"));
+            };
+            if key.contains(['\r', '\n', '"']) {
+                return Err(CanvasError::Invalid("invalid upload parameter name"));
+            }
+            prefix.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n")
+                    .as_bytes(),
+            );
+            prefix.extend_from_slice(value.as_bytes());
+            prefix.extend_from_slice(b"\r\n");
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(CanvasError::Invalid("invalid submission file name"))?
+            .replace(['\r', '\n', '"'], "_");
+        prefix.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| CanvasError::Invalid("could not open submission file"))?;
+        let size = file
+            .metadata()
+            .await
+            .map_err(|_| CanvasError::Invalid("could not read submission file"))?
+            .len();
+        if size != expected_size {
+            return Err(CanvasError::Invalid("submission file changed after review"));
+        }
+        let suffix = format!("\r\n--{boundary}--\r\n").into_bytes();
+        let body = crate::upload_body::UploadBody::new(prefix, file, size, suffix)
+            .map_err(|_| CanvasError::Invalid("submission file is too large"))?;
+        let length = body.len();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .https_only(true)
+            .build()
+            .map_err(|_| CanvasError::Invalid("could not initialise upload client"))?;
+        let response = client
+            .post(parsed)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header(reqwest::header::CONTENT_LENGTH, length)
+            .body(reqwest::Body::wrap(body))
+            .send()
+            .await
+            .map_err(|e| {
+                CanvasError::Network(if e.is_timeout() {
+                    NetError::Timeout
+                } else {
+                    NetError::Other
+                })
+            })?;
+        if response.status().is_redirection() || response.status() == reqwest::StatusCode::CREATED {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .ok_or(CanvasError::Invalid("upload redirect missing"))?;
+            let target = reqwest::Url::parse(location)
+                .or_else(|_| reqwest::Url::parse(&self.origin).and_then(|base| base.join(location)))
+                .map_err(|_| CanvasError::Invalid("invalid upload redirect"))?;
+            let origin = reqwest::Url::parse(&self.origin)
+                .map_err(|_| CanvasError::Invalid("invalid Canvas origin"))?;
+            let parts: Vec<_> = target.path().split('/').filter(|p| !p.is_empty()).collect();
+            let file_path = parts.len() >= 4
+                && parts[..3] == ["api", "v1", "files"]
+                && crate::model::valid_id(parts[3]);
+            let expected_path = if response.status() == reqwest::StatusCode::CREATED {
+                file_path
+                    && (parts.len() == 4 || (parts.len() == 5 && parts[4] == "create_success"))
+            } else {
+                file_path && parts.len() == 5 && parts[4] == "create_success"
+            };
+            if target.origin() != origin.origin() || !expected_path {
+                return Err(CanvasError::Invalid("upload redirect left Canvas"));
+            }
+            let endpoint = target
+                .as_str()
+                .strip_prefix(&self.origin)
+                .ok_or(CanvasError::Invalid("upload redirect left Canvas"))?;
+            return self.get_json(endpoint).await.map(|(v, _)| v);
+        }
+        if !response.status().is_success() {
+            return Err(CanvasError::Http(response.status().as_u16()));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| CanvasError::Network(NetError::Other))?;
+        if bytes.len() > crate::transport::MAX_BODY {
+            return Err(CanvasError::Network(NetError::TooLarge));
+        }
+        parse_json(&bytes)
     }
 
     /// Follow `Link: rel="next"` until exhausted. A missing page is an error,
@@ -301,7 +466,9 @@ impl CanvasClient {
                 return Err(CanvasError::Invalid("too many pages"));
             }
             let sent = Instant::now();
-            let response = self.exchange(Method::Get, &current, None, false).await?;
+            let response = self
+                .exchange(Method::Get, &current, None, false, "")
+                .await?;
             stats.network_ms += elapsed_ms(sent);
             stats.requests += 1;
             stats.bytes += response.body.len();
@@ -338,7 +505,13 @@ impl CanvasClient {
             .map_err(|_| CanvasError::Invalid("could not encode query"))?;
         let sent = Instant::now();
         let response = self
-            .exchange(Method::Post, "/api/graphql", Some(body), send_csrf)
+            .exchange(
+                Method::Post,
+                "/api/graphql",
+                Some(body),
+                send_csrf,
+                "application/json",
+            )
             .await?;
         let network_ms = elapsed_ms(sent);
         let parse_started = Instant::now();
@@ -377,6 +550,20 @@ impl CanvasClient {
 
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn form_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+            encoded.push(byte as char);
+        } else if byte == b' ' {
+            encoded.push('+');
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -629,6 +816,62 @@ pub mod tests {
         let reqs = t.requests.lock().unwrap();
         assert_eq!(header(&reqs[0], "x-csrf-token"), Some("t+1"));
         assert_eq!(reqs[0].method, Method::Post);
+    }
+
+    #[tokio::test]
+    async fn submission_post_uses_session_csrf_and_preserves_validation_error() {
+        let t = FakeTransport::new(vec![
+            json(200, r#"{"submitted_at":"2026-10-21T12:00:00Z"}"#),
+            json(422, r#"{"errors":[{"message":"invalid file"}]}"#),
+        ]);
+        let c = client(t.clone());
+        let path = "/api/v1/courses/1/assignments/2/submissions";
+        let value: Value = c.post_json(path, &serde_json::json!({"submission":{"submission_type":"online_upload","file_ids":["3"]}})).await.unwrap();
+        assert!(value.get("submitted_at").is_some());
+        assert_eq!(
+            c.post_json::<Value>(path, &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+            CanvasError::Http(422)
+        );
+        let requests = t.requests.lock().unwrap();
+        assert_eq!(requests[0].method, Method::Post);
+        assert_eq!(header(&requests[0], "x-csrf-token"), Some("t+1"));
+        assert_eq!(
+            header(&requests[0], "content-type"),
+            Some("application/json")
+        );
+        assert!(
+            String::from_utf8_lossy(requests[0].body.as_ref().unwrap()).contains("online_upload")
+        );
+    }
+
+    #[tokio::test]
+    async fn form_post_encodes_repeated_file_ids_and_sends_csrf() {
+        let t = FakeTransport::new(vec![json(
+            200,
+            r#"{"submitted_at":"2026-10-22T00:00:00Z"}"#,
+        )]);
+        let c = client(t.clone());
+        let _: Value = c
+            .post_form(
+                "/api/v1/courses/1/assignments/2/submissions",
+                &[
+                    ("submission[submission_type]", "online_upload"),
+                    ("submission[file_ids][]", "3"),
+                    ("submission[file_ids][]", "4"),
+                ],
+            )
+            .await
+            .unwrap();
+        let requests = t.requests.lock().unwrap();
+        assert_eq!(
+            header(&requests[0], "content-type"),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(header(&requests[0], "x-csrf-token"), Some("t+1"));
+        let body = String::from_utf8_lossy(requests[0].body.as_ref().unwrap());
+        assert!(body.contains("submission%5Bfile_ids%5D%5B%5D=3&submission%5Bfile_ids%5D%5B%5D=4"));
     }
 
     #[tokio::test]

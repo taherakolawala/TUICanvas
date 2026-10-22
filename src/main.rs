@@ -1,4 +1,4 @@
-//! TUICanvas: a keyboard-driven terminal reader for Canvas.
+//! TUICanvas: a keyboard-driven terminal interface for Canvas.
 
 mod announcements;
 mod api;
@@ -16,12 +16,14 @@ mod procstats;
 mod protect;
 mod session;
 mod smoke;
+mod submission;
 mod theme;
 mod transport;
 mod tui;
 mod ui;
+mod upload_body;
 
-const HELP: &str = "TUICanvas — terminal Canvas reader
+const HELP: &str = "TUICanvas — terminal Canvas interface
 
 Usage:
   tuicanvas                 Open the reader (signs in first if needed)
@@ -37,7 +39,7 @@ Usage:
                             writes benchmarks/private/tui-bench*.json
 
 Keys: arrows/jk move, Enter open, Esc back, / filter, r refresh,
-      o open in browser, L sign in, q quit
+      s submit files from an assignment, o open in browser, L sign in, q quit
 Env:  TUICANVAS_ORIGIN (default https://ufl.instructure.com), TUICANVAS_HOME";
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {

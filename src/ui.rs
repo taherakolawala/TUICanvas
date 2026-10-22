@@ -79,6 +79,144 @@ fn long_date(at: DateTime<Utc>) -> String {
         .to_string()
 }
 
+fn draw_submission(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
+    let Some(draft) = &app.submission else {
+        return;
+    };
+    let ViewKind::Detail {
+        course_id,
+        assignment_id,
+        course_name,
+        title,
+    } = &app.view().kind
+    else {
+        return;
+    };
+    let detail = app
+        .details
+        .get(&(course_id.clone(), assignment_id.clone()))
+        .and_then(|r| r.data.as_ref());
+    let mut lines = vec![
+        Line::from(Span::styled(
+            if draft.reviewing || draft.busy {
+                "Review file submission"
+            } else {
+                "Add files to submit"
+            },
+            theme::bold(),
+        )),
+        Line::from(format!("Course: {course_name}")),
+        Line::from(format!("Assignment: {title}")),
+    ];
+    if let Some(d) = detail {
+        lines.push(Line::from(format!(
+            "Due: {}",
+            d.base
+                .due_at
+                .map(long_date)
+                .unwrap_or_else(|| "No due date".into())
+        )));
+        if d.base.due_at.is_some_and(|due| now > due) {
+            lines.push(Line::from(Span::styled(
+                "This submission will be late.",
+                theme::alert(),
+            )));
+        }
+        let used = crate::submission::prior_attempts(d);
+        let limit = d
+            .allowed_attempts
+            .map(|n| {
+                if n < 0 {
+                    "unlimited".into()
+                } else {
+                    n.to_string()
+                }
+            })
+            .unwrap_or_else(|| "unknown".into());
+        lines.push(Line::from(format!("Attempt: {} of {limit}", used + 1)));
+        if draft.reviewing
+            && d.base
+                .submission
+                .as_ref()
+                .is_some_and(|s| s.submitted_at.is_some())
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Resubmission: confirming creates attempt {} on Canvas.",
+                    used + 1
+                ),
+                theme::alert(),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    for (i, file) in draft.files.iter().enumerate() {
+        lines.push(Line::from(format!(
+            "{}. {} ({})",
+            i + 1,
+            file.name,
+            human_size(file.size)
+        )));
+        if draft.reviewing || draft.busy {
+            lines.push(Line::from(format!("   {}", file.path.display())));
+        }
+    }
+    lines.push(Line::from(""));
+    if draft.busy {
+        lines.push(Line::from(Span::styled(
+            "Uploading and verifying… Please wait.",
+            theme::syncing(),
+        )));
+    } else if draft.reviewing {
+        lines.push(Line::from(Span::styled(
+            "Press y to upload and submit these files to Canvas.",
+            theme::alert(),
+        )));
+    } else {
+        lines.push(Line::from(
+            "Start in your user folder; type a name or paste a full path. Enter adds it.",
+        ));
+        lines.push(Line::from(
+            "After adding files, Enter at the starting folder opens review. Ctrl+U clears the path.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Path: {}▏", draft.input)));
+        if !draft.suggestions.matches.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Suggestions · ↑/↓ select · Tab complete",
+                theme::muted(),
+            )));
+            let room = usize::from(area.height).saturating_sub(lines.len());
+            for (index, suggestion) in draft.suggestions.matches.iter().take(room).enumerate() {
+                let label = format!(
+                    "  {} {}{}",
+                    if index == draft.suggestions.selected {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    suggestion.name,
+                    if suggestion.directory { "\\" } else { "" }
+                );
+                lines.push(Line::from(Span::styled(
+                    label,
+                    if index == draft.suggestions.selected {
+                        theme::selected()
+                    } else if suggestion.directory {
+                        theme::code()
+                    } else {
+                        theme::text()
+                    },
+                )));
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
 fn submission_type(t: &str) -> &str {
     match t {
         "online_upload" => "File upload",
@@ -109,46 +247,59 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
     draw_top(frame, top, app, now);
-    match app.view().kind.clone() {
-        ViewKind::Courses => draw_courses(frame, main, app),
-        ViewKind::Assignments { course_id, .. } => {
-            let [tabs, body] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-            draw_tabs(frame, tabs, 0);
-            draw_assignments(frame, body, app, &course_id, now)
-        }
-        ViewKind::Files { course_id, .. } => {
-            let [tabs, body] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-            draw_tabs(frame, tabs, 1);
-            draw_files(frame, body, app, &course_id, now)
-        }
-        ViewKind::Announcements { course_id, .. } => {
-            let [tabs, body] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
-            draw_tabs(frame, tabs, 2);
-            draw_announcements(frame, body, app, &course_id, now);
-        }
-        ViewKind::Announcement {
+    if app.submission.is_some() {
+        draw_submission(frame, main, app, now);
+    } else if app.history_open {
+        if let ViewKind::Detail {
             course_id,
-            course_name,
-            announcement_id,
-            ..
-        } => draw_announcement(frame, main, app, &course_id, &announcement_id, &course_name),
-        ViewKind::Detail {
-            course_id,
-            course_name,
             assignment_id,
             ..
-        } => draw_detail(
-            frame,
-            main,
-            app,
-            &course_id,
-            &assignment_id,
-            &course_name,
-            now,
-        ),
+        } = app.view().kind.clone()
+        {
+            draw_history(frame, main, app, &course_id, &assignment_id);
+        }
+    } else {
+        match app.view().kind.clone() {
+            ViewKind::Courses => draw_courses(frame, main, app),
+            ViewKind::Assignments { course_id, .. } => {
+                let [tabs, body] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+                draw_tabs(frame, tabs, 0);
+                draw_assignments(frame, body, app, &course_id, now)
+            }
+            ViewKind::Files { course_id, .. } => {
+                let [tabs, body] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+                draw_tabs(frame, tabs, 1);
+                draw_files(frame, body, app, &course_id, now)
+            }
+            ViewKind::Announcements { course_id, .. } => {
+                let [tabs, body] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+                draw_tabs(frame, tabs, 2);
+                draw_announcements(frame, body, app, &course_id, now);
+            }
+            ViewKind::Announcement {
+                course_id,
+                course_name,
+                announcement_id,
+                ..
+            } => draw_announcement(frame, main, app, &course_id, &announcement_id, &course_name),
+            ViewKind::Detail {
+                course_id,
+                course_name,
+                assignment_id,
+                ..
+            } => draw_detail(
+                frame,
+                main,
+                app,
+                &course_id,
+                &assignment_id,
+                &course_name,
+                now,
+            ),
+        }
     }
     draw_footer(frame, bottom, app);
 }
@@ -198,7 +349,12 @@ fn sync_text<T>(res: Option<&Resource<T>>, spinner: usize, now: DateTime<Utc>) -
 fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     let mut crumbs = vec!["Canvas".to_string()];
     let (status, style) = match &app.view().kind {
-        ViewKind::Courses => sync_text(Some(&app.courses), app.spinner, now),
+        ViewKind::Courses => {
+            if app.editing_home {
+                crumbs.push("Edit home".into());
+            }
+            sync_text(Some(&app.courses), app.spinner, now)
+        }
         ViewKind::Assignments {
             course_id,
             course_name,
@@ -237,11 +393,21 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         } => {
             crumbs.push(course_name.clone());
             crumbs.push(title.clone());
-            sync_text(
-                app.details.get(&(course_id.clone(), assignment_id.clone())),
-                app.spinner,
-                now,
-            )
+            if app.history_open {
+                crumbs.push("Past submissions".into());
+                sync_text(
+                    app.histories
+                        .get(&(course_id.clone(), assignment_id.clone())),
+                    app.spinner,
+                    now,
+                )
+            } else {
+                sync_text(
+                    app.details.get(&(course_id.clone(), assignment_id.clone())),
+                    app.spinner,
+                    now,
+                )
+            }
         }
         ViewKind::Files {
             course_id,
@@ -328,11 +494,37 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         )]
     } else if let Some(notice) = &app.notice {
         vec![Span::styled(notice.clone(), theme::notice())]
+    } else if app.history_open {
+        hint_spans(&[
+            ("←/→", "attempt"),
+            ("↑/↓", "scroll"),
+            ("r", "refresh"),
+            ("Esc", "assignment"),
+        ])
+    } else if let Some(draft) = &app.submission {
+        let hints = if draft.busy {
+            &[("", "Uploading and verifying on Canvas…")][..]
+        } else if draft.reviewing {
+            &[("y", "submit now"), ("n/Esc", "edit files")][..]
+        } else {
+            &[
+                ("↑↓", "suggestions"),
+                ("Tab", "complete"),
+                ("Ctrl+U", "clear path"),
+                ("Enter", "add / review"),
+                ("Esc", "cancel"),
+            ][..]
+        };
+        hint_spans(hints)
     } else {
         let hints: &[(&str, &str)] = match view.kind {
+            ViewKind::Courses if app.editing_home => {
+                &[("↑↓", "move"), ("Enter", "hide/restore"), ("Esc", "done")]
+            }
             ViewKind::Courses => &[
                 ("↑↓", "move"),
                 ("Enter", "open"),
+                ("E", "edit home"),
                 ("e", "your files"),
                 ("/", "filter"),
                 ("r", "refresh"),
@@ -381,6 +573,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                         ("Enter", "open"),
                         ("d", "download"),
                         ("D", "all files"),
+                        ("s", "submit"),
+                        ("h", "past submissions"),
                         ("e", "show folder"),
                         ("o", "browser"),
                         ("Esc", "done"),
@@ -391,6 +585,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                         ("↑↓", "scroll"),
                         ("Tab", "files & links"),
                         ("D", "download files"),
+                        ("s", "submit"),
+                        ("h", "past submissions"),
                         ("Esc", "back"),
                         ("r", "refresh"),
                         ("o", "open in browser"),
@@ -400,6 +596,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             }
             ViewKind::Detail { .. } => &[
                 ("↑↓", "scroll"),
+                ("s", "submit"),
+                ("h", "past submissions"),
                 ("Esc", "back"),
                 ("r", "refresh"),
                 ("o", "open in browser"),
@@ -518,7 +716,23 @@ fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let rows = app.visible_rows();
     if rows.is_empty() {
-        empty_message(frame, area, &app.view().filter, "courses");
+        if !app.editing_home
+            && app.view().filter.is_empty()
+            && app.courses.data.as_ref().is_some_and(|c| !c.is_empty())
+        {
+            frame.render_widget(
+                Paragraph::new("All courses are hidden. Press E to edit home and restore them.")
+                    .style(theme::muted())
+                    .alignment(Alignment::Center),
+                Rect {
+                    y: area.y + area.height / 3,
+                    height: 1,
+                    ..area
+                },
+            );
+        } else {
+            empty_message(frame, area, &app.view().filter, "courses");
+        }
         return;
     }
     let (start, end) = window(app, rows.len(), usize::from(area.height.saturating_sub(1)));
@@ -537,7 +751,16 @@ fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
                     " "
                 })
                 .style(theme::favorite()),
-                Cell::from(c.title().to_string()),
+                Cell::from(if app.hidden_courses.contains(&c.id) {
+                    format!("{} [hidden]", c.title())
+                } else {
+                    c.title().to_string()
+                })
+                .style(if app.hidden_courses.contains(&c.id) {
+                    theme::muted()
+                } else {
+                    Style::default()
+                }),
                 Cell::from(c.course_code.clone().unwrap_or_default()).style(theme::code()),
                 Cell::from(
                     c.term
@@ -1356,6 +1579,134 @@ fn draw_detail(
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+fn draw_history(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    course_id: &str,
+    assignment_id: &str,
+) {
+    let key = (course_id.to_string(), assignment_id.to_string());
+    if placeholder(frame, area, app.histories.get(&key), "submission history") {
+        return;
+    }
+    let res = &app.histories[&key];
+    let history = res.data.as_ref().expect("checked");
+    if history.attempts.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No past submissions for this assignment."),
+            area,
+        );
+        return;
+    }
+    let selected = app.history_selected.min(history.attempts.len() - 1);
+    let attempt = &history.attempts[selected];
+    let width = area.width.saturating_sub(2).min(110);
+    let stale = !matches!(&app.history_render, Some(r)
+        if r.key == key && r.version == res.version && r.selected == selected && r.width == width);
+    if stale {
+        app.history_render = Some(crate::app::HistoryRender {
+            key: key.clone(),
+            version: res.version,
+            selected,
+            width,
+            lines: attempt
+                .body
+                .as_deref()
+                .filter(|body| !body.trim().is_empty())
+                .map(|body| html::render(body, usize::from(width), &app.origin))
+                .unwrap_or_default(),
+        });
+    }
+    let mut lines = vec![
+        Line::styled("Past submissions", theme::heading()),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "Attempt {}  ·  {} of {}{}",
+                    attempt
+                        .attempt
+                        .unwrap_or((history.attempts.len() - selected) as i64),
+                    selected + 1,
+                    history.attempts.len(),
+                    if selected == 0 { "  ·  latest" } else { "" }
+                ),
+                theme::bold(),
+            ),
+            Span::styled("  ← newer  → older", theme::muted()),
+        ]),
+        Line::from(format!(
+            "Submitted: {}",
+            attempt
+                .submitted_at
+                .map(long_date)
+                .unwrap_or_else(|| "Unknown".into())
+        )),
+    ];
+    if let Some(kind) = &attempt.submission_type {
+        lines.push(Line::from(format!("Type: {}", submission_type(kind))));
+    }
+    if let Some(state) = &attempt.workflow_state {
+        lines.push(Line::from(format!(
+            "Status: {}{}",
+            html::sanitize(state),
+            if attempt.late == Some(true) {
+                " · late"
+            } else {
+                ""
+            }
+        )));
+    }
+    if let Some(grade) = &attempt.grade {
+        lines.push(Line::from(format!("Grade: {}", html::sanitize(grade))));
+    } else if let Some(score) = attempt.score {
+        lines.push(Line::from(format!("Score: {}", fmt_num(score))));
+    }
+    if let Some(url) = &attempt.url {
+        lines.push(Line::from(format!(
+            "Submitted URL: {}",
+            truncate(&html::sanitize(url), usize::from(width).saturating_sub(15))
+        )));
+    }
+    if !attempt.attachments.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Files", theme::heading()));
+        for file in &attempt.attachments {
+            let size = file
+                .size
+                .map(|n| format!(" ({})", human_size(n)))
+                .unwrap_or_default();
+            lines.push(Line::from(format!(
+                "  • {}{}",
+                truncate(
+                    &html::sanitize(file.name()),
+                    usize::from(width).saturating_sub(size.len() + 4)
+                ),
+                size
+            )));
+        }
+    }
+    let body = &app.history_render.as_ref().expect("rendered").lines;
+    if !body.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Text", theme::heading()));
+        lines.extend(body.iter().map(|line| style_line(line)));
+    }
+    let height = usize::from(area.height);
+    app.history_scroll = app.history_scroll.min(lines.len().saturating_sub(height));
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(app.history_scroll)
+        .take(height)
+        .collect();
+    let inner = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
 fn draw_announcement(
     frame: &mut Frame,
     area: Rect,
@@ -1605,6 +1956,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn course_list_labels_hidden_entries_and_explains_how_to_restore_all() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        let effects = app.start();
+        deliver(
+            &mut app,
+            effects,
+            Payload::Courses(vec![Course {
+                id: "1".into(),
+                name: Some("Only course".into()),
+                ..Default::default()
+            }]),
+        );
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('E'),
+            KeyModifiers::NONE,
+        )));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(screen(&mut app, 90, 14).contains("Press E to edit home"));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('E'),
+            KeyModifiers::NONE,
+        )));
+        let rendered = screen(&mut app, 90, 14);
+        assert!(rendered.contains("Edit home") && rendered.contains("Only course [hidden]"));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(screen(&mut app, 90, 14).contains("Only course"));
+        assert!(app.hidden_courses.is_empty());
+    }
+
     /// Replays private saved responses without printing announcement contents.
     #[test]
     #[ignore = "requires private saved announcement snapshots"]
@@ -1801,6 +2184,25 @@ mod tests {
         assert!(
             s.contains("Due") && s.contains("Lab-2 slides") && s.contains("Implement the kernel")
         );
+        let effects = app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        assert!(screen(&mut app, 100, 18).contains("Past submissions"));
+        let history = crate::submission::History::parse(serde_json::json!({
+            "attempt": 2, "submitted_at": "2026-10-22T12:00:00Z",
+            "submission_history": [
+                {"attempt": 1, "submitted_at": "2026-10-20T12:00:00Z", "submission_type": "online_text_entry", "body": "<p>First draft</p>"},
+                {"attempt": 2, "submitted_at": "2026-10-22T12:00:00Z", "submission_type": "online_upload", "attachments": [{"display_name": "final.pdf", "size": 42}]}
+            ]
+        })).unwrap();
+        deliver(&mut app, effects, Payload::History(history));
+        let s = screen(&mut app, 100, 18);
+        assert!(s.contains("final.pdf") && s.contains("Attempt 2"));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let s = screen(&mut app, 100, 18);
+        assert!(s.contains("First draft") && s.contains("Attempt 1"));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         // Refresh failure keeps content but marks it outdated.
         let effects = app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('r'),

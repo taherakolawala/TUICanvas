@@ -1,6 +1,5 @@
-//! Account-scoped snapshot store for approved resources (course list,
-//! assignment lists, assignment details). Snapshots are only ever displayed
-//! as "saved copies" while a fresh request runs; they never skip a refresh.
+//! Account-scoped snapshots and local UI preferences. Snapshots are displayed
+//! as saved copies while fresh requests run; preferences are kept separately.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +12,8 @@ pub enum ResourceKey {
     Courses,
     Assignments(String),
     Detail(String, String),
+    /// Loaded on demand; kept only in memory because attempts may contain work.
+    History(String, String),
     Announcements(String),
     Announcement(String, String),
     /// A course's Files area (folder tree and file list).
@@ -38,6 +39,7 @@ impl ResourceKey {
             ResourceKey::Detail(c, a) if ok(c) && ok(a) => {
                 format!("assignment-{}-{}", c.replace('~', "_"), a.replace('~', "_"))
             }
+            ResourceKey::History(..) => return None,
             ResourceKey::Files(c) if ok(c) => format!("files-{}", c.replace('~', "_")),
             ResourceKey::File(f) if ok(f) => format!("file-{}", f.replace('~', "_")),
             _ => return None,
@@ -52,6 +54,7 @@ impl ResourceKey {
             ResourceKey::Announcement(..) => "announcement",
             ResourceKey::Assignments(_) => "assignments",
             ResourceKey::Detail(..) => "assignment",
+            ResourceKey::History(..) => "submission history",
             ResourceKey::Files(_) => "files",
             ResourceKey::File(_) => "file",
         }
@@ -135,6 +138,17 @@ impl SnapshotStore {
 
     pub fn save_announcement_reads(&self, reads: &std::collections::BTreeSet<(String, String)>) {
         self.save_named("local-announcement-reads.json", reads, Utc::now());
+    }
+
+    /// Local course visibility does not change Canvas enrollment or its course snapshot.
+    pub fn hidden_courses(&self) -> std::collections::BTreeSet<String> {
+        self.load_named("local-hidden-courses.json")
+            .map(|(ids, _)| ids)
+            .unwrap_or_default()
+    }
+
+    pub fn save_hidden_courses(&self, ids: &std::collections::BTreeSet<String>) {
+        self.save_named("local-hidden-courses.json", ids, Utc::now());
     }
 }
 

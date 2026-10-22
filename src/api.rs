@@ -74,6 +74,23 @@ pub async fn assignment(
         .await
 }
 
+/// Fetched only when the student opens an assignment's past submissions.
+pub async fn submission_history(
+    client: &CanvasClient,
+    course_id: &str,
+    assignment_id: &str,
+) -> Result<(crate::submission::History, FetchStats), CanvasError> {
+    check(course_id)?;
+    check(assignment_id)?;
+    let path = format!(
+        "/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/self?include[]=submission_history"
+    );
+    let (value, stats) = client.get_json(&path).await?;
+    let history = crate::submission::History::parse(value)
+        .map_err(|_| CanvasError::Invalid("invalid submission history"))?;
+    Ok((history, stats))
+}
+
 pub async fn file(
     client: &CanvasClient,
     file_id: &str,
@@ -353,6 +370,29 @@ mod tests {
             CanvasError::Unauthenticated
         );
         assert_eq!(t.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_is_one_explicit_read_with_attempts() {
+        let t = FakeTransport::new(vec![json(
+            200,
+            r#"{
+            "attempt":2,"submitted_at":"2026-10-22T12:00:00Z",
+            "submission_history":[
+              {"attempt":1,"submitted_at":"2026-10-20T12:00:00Z","body":"First"},
+              {"attempt":2,"submitted_at":"2026-10-22T12:00:00Z","attachments":[{"filename":"new.pdf"}]}
+            ]}"#,
+        )]);
+        let c = client(t.clone());
+        let (history, stats) = submission_history(&c, "10", "20").await.unwrap();
+        assert_eq!(stats.requests, 1);
+        assert_eq!(history.attempts.len(), 2);
+        let requests = t.requests.lock().unwrap();
+        assert!(
+            requests[0].url.contains(
+                "/courses/10/assignments/20/submissions/self?include[]=submission_history"
+            )
+        );
     }
 
     #[tokio::test]

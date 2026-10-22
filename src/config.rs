@@ -28,7 +28,7 @@ impl Config {
         })
     }
 
-    /// The Python helper writes this exact file for the UF installation.
+    /// Protected session file, scoped to the configured Canvas host.
     pub fn session_path(&self) -> PathBuf {
         let name = if self.host == "ufl.instructure.com" {
             "ufl.session.dpapi".to_string()

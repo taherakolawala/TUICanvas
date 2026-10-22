@@ -147,14 +147,14 @@ Links to Canvas content the reader does not handle yet (modules, discussions, pa
 
 ### Testing
 
-Submissions are tested against a separate Canvas Lite course with a teacher account and a student account the user created, never against real courses. Read-only file features are developed against the user's real courses. Unit tests use the scripted transport as before.
+The user later chose to use their UF Canvas account instead of the separate Canvas Lite course. The first live submission must be to a real assignment they deliberately select with the actual file path(s) they intend to submit, using the in-app review and explicit confirmation. Read-only checks and offline scripted tests run before that submission. No dummy file is sent to a real course.
 
 ### Milestones
 
 7. Local library: folders, index, hard links, safe downloads, eviction, resync. **Done 2026-10-21.**
 8. Class Files browser and assignment attachments (read-only against real courses). **Done 2026-10-21.**
-9. Sign-in for a non-UF Canvas origin (visible-browser mode) to reach the test course.
-10. Submissions (file upload and text entry) against the test course, then first real use by the user.
+9. Sign-in for a non-UF Canvas origin (visible-browser mode). Optional for broader site support; no longer needed for the first live upload.
+10. Submissions (file upload and text entry). First live file upload uses a user-selected UF assignment and file(s), with explicit in-app confirmation.
 
 ## Technical references
 

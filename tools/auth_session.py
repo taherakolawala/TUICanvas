@@ -7,12 +7,23 @@ from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-CANVAS = "ufl.instructure.com"
+def configured_canvas_host():
+    origin = os.environ.get("TUICANVAS_ORIGIN", "https://ufl.instructure.com").rstrip("/")
+    parsed = urllib.parse.urlsplit(origin)
+    if (parsed.scheme != "https" or parsed.path or parsed.query or parsed.fragment
+            or parsed.port is not None or parsed.username is not None
+            or not parsed.hostname or not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname)):
+        raise ValueError("TUICANVAS_ORIGIN must be a plain HTTPS Canvas origin")
+    return parsed.hostname.lower()
+
+
+CANVAS = configured_canvas_host()
 ORIGIN = "https://" + CANVAS
 PROFILE = "/api/v1/users/self/profile"
 
@@ -52,7 +63,7 @@ def session_path():
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         raise SessionError("LOCALAPPDATA is unavailable.")
-    return Path(base) / "TUICanvas" / "ufl.session.dpapi"
+    return Path(base) / "TUICanvas" / ("ufl.session.dpapi" if CANVAS == "ufl.instructure.com" else CANVAS + ".session.dpapi")
 
 
 def save_session(browser_state, user_id, path=None):
@@ -87,7 +98,9 @@ def canvas_jar(browser_state):
         domain = item.get("domain", "")
         # Include only the Canvas host or a genuine parent-domain cookie.
         host_only = not domain.startswith(".")
-        match = domain in {CANVAS, "." + CANVAS, ".instructure.com"}
+        match = domain in {CANVAS, "." + CANVAS}
+        if CANVAS.endswith(".instructure.com"):
+            match = match or domain == ".instructure.com"
         if not match or not domain:
             continue
         expires = item.get("expires", -1)

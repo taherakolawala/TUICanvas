@@ -52,6 +52,28 @@ pub(crate) struct Executor {
 }
 
 impl Executor {
+    fn submit(
+        &self,
+        course_id: String,
+        assignment_id: String,
+        files: Vec<crate::submission::FileChoice>,
+    ) {
+        let client = self.client.clone();
+        let session = self.session.clone();
+        let session_path = self.session_path.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result =
+                crate::submission::submit(&client, &course_id, &assignment_id, &files).await;
+            persist_rotated_cookies(&client, &session, &session_path);
+            let _ = tx.send(Msg::Submitted {
+                course_id,
+                assignment_id,
+                result,
+            });
+        });
+    }
+
     pub(crate) fn session_handle(&self) -> Arc<Mutex<SessionFile>> {
         self.session.clone()
     }
@@ -81,6 +103,9 @@ impl Executor {
                 ResourceKey::Detail(c, a) => api::assignment(&client, c, a)
                     .await
                     .map(|(v, s)| (Payload::Detail(Box::new(v)), s)),
+                ResourceKey::History(c, a) => api::submission_history(&client, c, a)
+                    .await
+                    .map(|(v, s)| (Payload::History(v), s)),
                 ResourceKey::Files(c) => api::course_files(&client, c).await.map(|(v, s)| {
                     let data = CourseFilesData {
                         folders: v.folders,
@@ -100,6 +125,7 @@ impl Executor {
                     Payload::Courses(v) => store.save(&key, v, at),
                     Payload::Assignments(v) => store.save(&key, v, at),
                     Payload::Detail(v) => store.save(&key, v.as_ref(), at),
+                    Payload::History(_) => {}
                     Payload::Files(v) => store.save(&key, v.as_ref(), at),
                     Payload::File(v) => store.save(&key, v.as_ref(), at),
                 }
@@ -296,6 +322,7 @@ impl Input {
                                 Msg::Key(key)
                             }
                             Ok(Event::Resize(w, h)) => Msg::Resize(w, h),
+                            Ok(Event::Paste(value)) => Msg::Paste(value),
                             Ok(_) => continue,
                             Err(_) => break,
                         };
@@ -586,6 +613,11 @@ pub fn run(config: &Config, options: Options) -> Result<(), String> {
                         app.dirty = true;
                     }
                 }
+                Effect::Submit {
+                    course_id,
+                    assignment_id,
+                    files,
+                } => executor.submit(course_id, assignment_id, files),
                 Effect::Login => {
                     input.pause();
                     ratatui::restore();

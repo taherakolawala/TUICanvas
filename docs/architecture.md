@@ -9,6 +9,8 @@ TUICanvas has two programs:
 
 The two share one file: the session, encrypted with Windows DPAPI at `%LOCALAPPDATA%\TUICanvas\ufl.session.dpapi`.
 
+The course list also has a local edit mode. Its hidden course IDs are kept in the origin and account scoped snapshot directory, separate from Canvas course data. A Canvas refresh cannot reset the user's home screen choices; editing adds no network reads.
+
 ## Overview
 
 ```mermaid

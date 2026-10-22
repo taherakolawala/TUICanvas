@@ -1,6 +1,6 @@
 # Project status
 
-Last updated: 2026-10-21. Update this file whenever a milestone moves.
+Last updated: 2026-10-22. Update this file whenever a milestone moves.
 
 ## Where things stand
 
@@ -16,8 +16,8 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 | 6. Hardening and delivery | Not started | |
 | 7. Local file library | **Done** | `%USERPROFILE%\TUICanvas\<course>\Class Files` and `Assignment Files`; one stored copy per file shown in several places through hard links; change detection; safe names; 30-day clean-up of automatic images; downloads restricted to Canvas and its storage hosts. Verified live: download, install, hard link, internet mark. |
 | 8. Class Files and assignment attachments | **Done** | Files tab per course (folders, search across the course, download one, a folder or all, show in Explorer); files & links list on each assignment, numbered like the text; images downloaded with the assignment; other assignments open in the reader, everything else in the browser |
-| 9. Sign-in for the Canvas Lite test site | Waiting on the test accounts | |
-| 10. Submissions (file upload, text entry) | After 9 | Tested only on the Canvas Lite course |
+| 9. Sign-in for other Canvas sites | Implemented, live check pending | The login helper uses an origin-scoped visible browser outside UF, with a separate protected session. Optional for the first live upload. |
+| 10. Submissions (file upload, text entry) | In progress | File-path upload UI and streamed Canvas API flow implemented; offline tests pass. Text entry and a live submission to a user-selected UF assignment remain. |
 
 ## What works today
 
@@ -27,9 +27,11 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - The app starts sign-in itself if the saved session has expired at launch. Mid-session expiry shows a banner and waits for `L`.
 - **Reader** (`target\release\tuicanvas.exe`).
   - Shows course list, assignment list (due date, status, points) and assignment detail (deadline, availability, status, attempts, description with links).
+  - **Edit home.** Press `E` on the course list to show every course and hide or restore one with `Enter`; `Esc` leaves edit mode. Hidden course choices are local to the account and survive refreshes and restarts.
   - **Files.** Each course has Assignments, Files and Announcements tabs (`Tab` / `Shift+Tab`). Files mirrors the course's Canvas folders; `Enter` opens a file in its default app (downloading it first if needed), `d` downloads, `D` downloads a whole folder, `e` shows it in File Explorer, `/` searches every folder. Each file shows whether it is saved, newer on Canvas, downloading or locked.
   - **Announcements.** Per-course list and details, newest posting date first; author/date/Canvas read status, title filter, saved copy + Syncing/Outdated, keyboard links and attachments. Full metadata pagination avoids dropping older-created announcements published recently. Body HTML is fetched only on opening. Files and inline images download only when chosen into `Announcement Files/<id>`. Replies open in the browser; reading marks it Read in the TUI across restarts without mutating Canvas read status.
   - **Assignment files & links.** A numbered list under each description, matching the `[n]` marks in the text. `Tab` or `1`–`9` selects, `Enter` opens (files in their app, other assignments in the reader, anything else in the browser), `d`/`D` download, `e` shows the folder, `o` opens the selected item's page in the browser.
+  - **Past submissions.** `h` on an assignment reads Canvas's attempt history on demand. `←`/`→` browse attempts; each shows its date, type, status, grade when visible, attached file names and submitted text or URL. History stays in memory, with a fresh read on each visit.
   - Files go to `C:\Users\<you>\TUICanvas` (`e` on the course list opens it). Images in an assignment download when you open it and are removed after 30 days unused.
   - Each screen shows its saved copy at once, with **Syncing** at the top, and is labelled **Outdated** if the fresh read fails.
   - Colours mark deadline urgency and status.
@@ -45,7 +47,7 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
   - All three build-plan performance goals are met.
 - **Downloads**, measured live: a 908 KB PDF in 1.1 s through the full redirect chain, saved, linked and marked as downloaded from the internet.
 - **Announcements live check (2026-10-21).** Rust read all 1,380 announcements across 17 courses and opened one detail in each of the 13 nonempty courses. Median list refresh: 237 ms. The 674-item course took 5.43 s across seven pages, 205 KB; cached lists remain visible while refreshing. Counts match the earlier probe; no account content is included in the report.
-- **Checks.** 72 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads, file access and one download; `tuicanvas --dump DIR` renders each screen headlessly, including the Files tab, and downloads one file into a scratch library.
+- **Checks.** 75 Rust tests (Windows) and 32 Python tests pass. `tuicanvas --smoke` re-verifies live reads, file access and one download; `tuicanvas --dump DIR` renders each screen headlessly, including the Files tab, and downloads one file into a scratch library.
 
 ## Known issues and limits
 
@@ -58,11 +60,11 @@ How the pieces fit together is described in [architecture.md](architecture.md). 
 - **The baseline is narrow:** one machine, one evening, 10 runs, with the browser headless. Good for medians, not for tail latency.
 - **Images open in an outside app.** Showing images inside the terminal is not done yet (Windows Terminal can display them; a possible later step).
 - **Locked and hidden files.** Files Canvas marks as locked are not downloaded (one past lab here). In 8 of 17 courses the instructor hides Files, so the Files tab is empty there; attachments linked from assignments still work. Two linked files return 403 and can only be opened in the browser.
-- **Out of scope for now:** modules, pages, discussions, inbox and calendar (links to them open in the browser); submitting comes in Milestone 10. Quizzes and assessments are permanently out of scope.
+- **Out of scope for now:** modules, pages, discussions, inbox and calendar (links to them open in the browser); text-entry submissions remain in Milestone 10. Quizzes and assessments are permanently out of scope.
 
 ## What's next
 
-**Now: version 2, submissions** (milestones 9–10 above). Milestone 9 waits for the Canvas Lite test accounts. A survey of all 161 assignments in your 17 courses shaped the plan:
+**Now: version 2, submissions** (milestones 9–10 above). The first live upload will use an assignment and files you choose in your UF account. A survey of all 161 assignments in your 17 courses shaped the plan:
 
 - **How work is handed in:** file upload 63, Canvas quizzes 52, external tools 34, text entry 18.
 - **What assignments link to:** 63 distinct Canvas files (32 PDFs, 9 images, 6 Word files), 18 Canvas pages, 28 modules and 49 outside sites.

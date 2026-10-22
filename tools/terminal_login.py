@@ -13,12 +13,21 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from tools.auth_probe import START, UF, trusted_url
+from tools.auth_probe import START as UF_START, UF, trusted_url as uf_trusted_url
 from tools.auth_ui import clean, duo_view, label, poll_key, render_view, transition_view, LoginView, Status
 from tools.auth_session import (CANVAS, ORIGIN, PROFILE, NativeCanvas, SessionError,
                                load_session, profile_id, save_session)
 
-REPORT = Path(__file__).resolve().parents[1] / "benchmarks/private/auth-login-result.json"
+START = UF_START if CANVAS == "ufl.instructure.com" else ORIGIN
+
+
+def trusted_url(url):
+    if CANVAS == "ufl.instructure.com":
+        return uf_trusted_url(url)
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname == CANVAS
+
+REPORT = Path(__file__).resolve().parents[1] / "benchmarks/private" / ("auth-login-result.json" if CANVAS == "ufl.instructure.com" else f"auth-login-{CANVAS}.json")
 # Once the browser is back on Canvas, confirm sign-in with a native API read at
 # most this often, and give up on the native read after this long.
 NATIVE_CHECK_INTERVAL = 1.5
@@ -120,7 +129,7 @@ def browser_login(args, saved, status=None):
     from playwright.sync_api import sync_playwright
 
     status = status or Status()
-    status.show("Connecting to UF")
+    status.show("Connecting to Canvas")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel=args.channel, headless=not args.browser)
         context = browser.new_context(storage_state=saved["browser_state"] if saved else None)
@@ -260,6 +269,8 @@ def main():
     parser.add_argument("--check", action="store_true", help="Only test saved session using native HTTP; no browser or prompts")
     parser.add_argument("--channel", choices=["msedge", "chrome"], default="msedge")
     args = parser.parse_args()
+    if CANVAS != "ufl.instructure.com":
+        args.browser = True
     if args.fresh and args.check:
         parser.error("--fresh and --check cannot be combined")
     status = Status()

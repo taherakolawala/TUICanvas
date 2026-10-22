@@ -2,18 +2,19 @@
 //! come in as messages; requests to fetch, open, or sign in go out as effects.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::cache::{ResourceKey, SnapshotStore};
 use crate::canvas::{CanvasError, FetchStats};
 use crate::html::{Link, Target};
 use crate::library::{self, Library, LocalState};
 use crate::model::{AssignmentDetail, AssignmentSummary, CanvasFile, CanvasFolder, Course};
+use crate::submission::{self, FileChoice};
 
 /// An in-flight read that started at most this long before an access may
 /// satisfy that access (approved freshness rule). Older ones may not.
@@ -63,6 +64,7 @@ pub enum Payload {
     Announcement(Box<crate::announcements::Detail>),
     Assignments(Vec<AssignmentSummary>),
     Detail(Box<AssignmentDetail>),
+    History(crate::submission::History),
     Files(Box<CourseFilesData>),
     File(Box<CanvasFile>),
 }
@@ -150,6 +152,7 @@ struct Placement {
 #[derive(Debug)]
 pub enum Msg {
     Key(KeyEvent),
+    Paste(String),
     Fetched {
         key: ResourceKey,
         request: u64,
@@ -165,6 +168,11 @@ pub enum Msg {
     Transfer {
         file_id: String,
         event: TransferEvent,
+    },
+    Submitted {
+        course_id: String,
+        assignment_id: String,
+        result: Result<String, String>,
     },
 }
 
@@ -186,6 +194,21 @@ pub enum Effect {
     OpenPath(PathBuf),
     /// Show a local folder in the file manager (created if missing).
     Reveal(PathBuf),
+    Submit {
+        course_id: String,
+        assignment_id: String,
+        files: Vec<FileChoice>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct SubmissionDraft {
+    pub input: String,
+    pub start_directory: String,
+    pub suggestions: submission::PathSuggestions,
+    pub files: Vec<FileChoice>,
+    pub reviewing: bool,
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -274,6 +297,14 @@ pub struct DetailRender {
     pub lines: Vec<String>,
 }
 
+pub struct HistoryRender {
+    pub key: (String, String),
+    pub version: u64,
+    pub selected: usize,
+    pub width: u16,
+    pub lines: Vec<String>,
+}
+
 pub struct App {
     pub origin: String,
     store: Option<Arc<SnapshotStore>>,
@@ -282,8 +313,15 @@ pub struct App {
     pub announcement_details: HashMap<(String, String), Resource<crate::announcements::Detail>>,
     pub announcement_render: Option<DetailRender>,
     announcement_reads: std::collections::BTreeSet<(String, String)>,
+    pub hidden_courses: std::collections::BTreeSet<String>,
+    pub editing_home: bool,
     pub assignments: HashMap<String, Resource<Vec<AssignmentSummary>>>,
     pub details: HashMap<(String, String), Resource<AssignmentDetail>>,
+    pub histories: HashMap<(String, String), Resource<submission::History>>,
+    pub history_open: bool,
+    pub history_selected: usize,
+    pub history_scroll: usize,
+    pub history_render: Option<HistoryRender>,
     pub stack: Vec<View>,
     next_request: u64,
     pub size: (u16, u16),
@@ -307,6 +345,7 @@ pub struct App {
     /// Running downloads; the first placement is where the file is being installed.
     pending: HashMap<String, Vec<Placement>>,
     pub library: Option<Arc<Library>>,
+    pub submission: Option<SubmissionDraft>,
 }
 
 fn matches_filter(text: &str, filter: &str) -> bool {
@@ -347,6 +386,10 @@ impl App {
             .as_ref()
             .map(|s| s.announcement_reads())
             .unwrap_or_default();
+        let hidden_courses = store
+            .as_ref()
+            .map(|s| s.hidden_courses())
+            .unwrap_or_default();
         App {
             origin: origin.to_string(),
             store,
@@ -355,8 +398,15 @@ impl App {
             announcement_details: HashMap::new(),
             announcement_render: None,
             announcement_reads,
+            hidden_courses,
+            editing_home: false,
             assignments: HashMap::new(),
             details: HashMap::new(),
+            histories: HashMap::new(),
+            history_open: false,
+            history_selected: 0,
+            history_scroll: 0,
+            history_render: None,
             stack: vec![View::new(ViewKind::Courses)],
             next_request: 0,
             size: (80, 24),
@@ -375,6 +425,7 @@ impl App {
             waiting: HashMap::new(),
             pending: HashMap::new(),
             library: None,
+            submission: None,
         }
     }
 
@@ -402,6 +453,9 @@ impl App {
                 .get(&(c.clone(), a.clone()))
                 .map(|r| &r.sync),
             ResourceKey::Detail(c, a) => self.details.get(&(c.clone(), a.clone())).map(|r| &r.sync),
+            ResourceKey::History(c, a) => {
+                self.histories.get(&(c.clone(), a.clone())).map(|r| &r.sync)
+            }
             ResourceKey::Files(c) => self.course_files.get(c).map(|r| &r.sync),
             ResourceKey::File(f) => self.files.get(f).map(|r| &r.sync),
         }
@@ -426,16 +480,33 @@ impl App {
             ResourceKey::Detail(c, a) => {
                 self.details.entry((c.clone(), a.clone())).or_default().sync = sync
             }
+            ResourceKey::History(c, a) => {
+                self.histories
+                    .entry((c.clone(), a.clone()))
+                    .or_default()
+                    .sync = sync
+            }
             ResourceKey::Files(c) => self.course_files.entry(c.clone()).or_default().sync = sync,
             ResourceKey::File(f) => self.files.entry(f.clone()).or_default().sync = sync,
         }
     }
 
     pub fn current_syncing(&self) -> bool {
-        matches!(
-            self.sync_of(&self.view().key()),
-            Some(SyncState::Syncing { .. })
-        )
+        let key = if self.history_open {
+            if let ViewKind::Detail {
+                course_id,
+                assignment_id,
+                ..
+            } = &self.view().kind
+            {
+                ResourceKey::History(course_id.clone(), assignment_id.clone())
+            } else {
+                self.view().key()
+            }
+        } else {
+            self.view().key()
+        };
+        matches!(self.sync_of(&key), Some(SyncState::Syncing { .. }))
     }
 
     /// Show a saved copy (if any and nothing newer is loaded), then request fresh data.
@@ -529,6 +600,7 @@ impl App {
                     res.version += 1;
                 }
             }
+            ResourceKey::History(..) => {}
             ResourceKey::Courses => {}
         }
     }
@@ -560,6 +632,37 @@ impl App {
                 self.dirty = true;
                 self.notice = None;
                 self.on_key(key)
+            }
+            Msg::Paste(value) => {
+                if let Some(draft) = &mut self.submission
+                    && !draft.reviewing
+                    && !draft.busy
+                {
+                    let value = value.trim_end_matches(['\r', '\n']);
+                    if value.contains(['\r', '\n']) {
+                        self.notice = Some("Paste one file path at a time.".into());
+                    } else {
+                        let replace = draft.input == draft.start_directory
+                            && Path::new(value.trim_matches('"')).is_absolute();
+                        let size = value.chars().count()
+                            + if replace {
+                                0
+                            } else {
+                                draft.input.chars().count()
+                            };
+                        if size > 1024 {
+                            return vec![];
+                        }
+                        if replace {
+                            draft.input = value.to_string();
+                        } else {
+                            draft.input.push_str(value);
+                        }
+                        draft.suggestions.update(&draft.input);
+                        self.dirty = true;
+                    }
+                }
+                vec![]
             }
             Msg::Fetched {
                 key,
@@ -593,6 +696,25 @@ impl App {
                 self.dirty = true;
                 self.on_transfer(file_id, event)
             }
+            Msg::Submitted {
+                course_id,
+                assignment_id,
+                result,
+            } => {
+                self.submission = None;
+                self.notice = Some(result.unwrap_or_else(|e| e));
+                self.dirty = true;
+                let mut effects = Vec::new();
+                if let Some(e) =
+                    self.request(ResourceKey::Detail(course_id.clone(), assignment_id), true)
+                {
+                    effects.push(e);
+                }
+                if let Some(e) = self.request(ResourceKey::Assignments(course_id), true) {
+                    effects.push(e);
+                }
+                effects
+            }
         }
     }
 
@@ -614,7 +736,12 @@ impl App {
             Ok((payload, stats)) => {
                 self.login_required = false;
                 self.applied.push(request);
-                if key == self.view().key() {
+                if key == self.view().key()
+                    || (self.history_open
+                        && matches!(&key, ResourceKey::History(c, a)
+                            if matches!(&self.view().kind, ViewKind::Detail { course_id, assignment_id, .. }
+                                if c == course_id && a == assignment_id)))
+                {
                     self.last_stats = Some((key.label(), stats));
                 }
                 let mut effects = Vec::new();
@@ -662,6 +789,17 @@ impl App {
                         r.sync = SyncState::Idle;
                         r.version += 1;
                         effects.extend(self.after_detail(c, a));
+                    }
+                    (Payload::History(history), ResourceKey::History(c, a)) => {
+                        let r = self.histories.entry((c.clone(), a.clone())).or_default();
+                        r.data = Some(history);
+                        r.origin = Origin::Network;
+                        r.fetched_at = Some(at);
+                        r.sync = SyncState::Idle;
+                        r.version += 1;
+                        let count = r.data.as_ref().map_or(0, |h| h.attempts.len());
+                        self.history_selected = self.history_selected.min(count.saturating_sub(1));
+                        self.history_scroll = 0;
                     }
                     (Payload::Files(data), ResourceKey::Files(c)) => {
                         let r = self.course_files.entry(c.clone()).or_default();
@@ -728,6 +866,7 @@ impl App {
                 .unwrap_or(&[])
                 .iter()
                 .enumerate()
+                .filter(|(_, c)| self.editing_home || !self.hidden_courses.contains(&c.id))
                 .filter(|(_, c)| {
                     matches_filter(c.title(), &view.filter)
                         || matches_filter(c.course_code.as_deref().unwrap_or(""), &view.filter)
@@ -1370,11 +1509,215 @@ impl App {
         (queued, running)
     }
 
+    fn start_submission(&mut self, course: &str, assignment: &str) -> Vec<Effect> {
+        let Some(resource) = self
+            .details
+            .get(&(course.to_string(), assignment.to_string()))
+        else {
+            self.notice = Some("Load the assignment before submitting.".into());
+            return vec![];
+        };
+        if resource.origin != Origin::Network || !matches!(resource.sync, SyncState::Idle) {
+            self.notice = Some("Wait for a fresh assignment sync before submitting.".into());
+            return vec![];
+        }
+        if !resource
+            .fetched_at
+            .is_some_and(|at| Utc::now() - at < chrono::Duration::minutes(2))
+        {
+            self.notice =
+                Some("Checking current submission rules. Press s again when synced.".into());
+            return self
+                .request(
+                    ResourceKey::Detail(course.to_string(), assignment.to_string()),
+                    true,
+                )
+                .into_iter()
+                .collect();
+        }
+        let Some(detail) = &resource.data else {
+            return vec![];
+        };
+        if let Err(reason) = submission::eligible(detail, Utc::now()) {
+            self.notice = Some(reason);
+            return vec![];
+        }
+        let start_directory = submission::starting_directory();
+        let mut suggestions = submission::PathSuggestions::default();
+        suggestions.update(&start_directory);
+        self.submission = Some(SubmissionDraft {
+            input: start_directory.clone(),
+            start_directory,
+            suggestions,
+            files: Vec::new(),
+            reviewing: false,
+            busy: false,
+        });
+        vec![]
+    }
+
+    fn open_history(&mut self, course: &str, assignment: &str) -> Vec<Effect> {
+        self.history_open = true;
+        self.history_selected = 0;
+        self.history_scroll = 0;
+        self.request(
+            ResourceKey::History(course.to_string(), assignment.to_string()),
+            true,
+        )
+        .into_iter()
+        .collect()
+    }
+
+    fn on_history_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let ViewKind::Detail {
+            course_id,
+            assignment_id,
+            ..
+        } = &self.view().kind
+        else {
+            self.history_open = false;
+            return vec![];
+        };
+        let (course_id, assignment_id) = (course_id.clone(), assignment_id.clone());
+        let count = self
+            .histories
+            .get(&(course_id.clone(), assignment_id.clone()))
+            .and_then(|r| r.data.as_ref())
+            .map_or(0, |h| h.attempts.len());
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('h') => self.history_open = false,
+            KeyCode::Left | KeyCode::BackTab => {
+                self.history_selected = self.history_selected.saturating_sub(1);
+                self.history_scroll = 0;
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.history_selected = (self.history_selected + 1).min(count.saturating_sub(1));
+                self.history_scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.history_scroll = self.history_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.history_scroll = self.history_scroll.saturating_add(1)
+            }
+            KeyCode::PageUp => {
+                self.history_scroll = self.history_scroll.saturating_sub(self.page());
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.history_scroll = self.history_scroll.saturating_add(self.page())
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.history_scroll = 0,
+            KeyCode::Char('r') => {
+                return self
+                    .request(ResourceKey::History(course_id, assignment_id), true)
+                    .into_iter()
+                    .collect();
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn on_submission_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let kind = self.view().kind.clone();
+        let draft = self.submission.as_mut().expect("checked above");
+        if draft.busy {
+            return vec![];
+        }
+        if draft.reviewing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => draft.reviewing = false,
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    draft.busy = true;
+                    if let ViewKind::Detail {
+                        course_id,
+                        assignment_id,
+                        ..
+                    } = &kind
+                    {
+                        return vec![Effect::Submit {
+                            course_id: course_id.clone(),
+                            assignment_id: assignment_id.clone(),
+                            files: draft.files.clone(),
+                        }];
+                    }
+                }
+                _ => {}
+            }
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc => self.submission = None,
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                draft.input.clear();
+                draft.suggestions.update(&draft.input);
+            }
+            KeyCode::Backspace if key.kind != KeyEventKind::Repeat => {
+                draft.input.pop();
+                draft.suggestions.update(&draft.input);
+            }
+            KeyCode::Up | KeyCode::BackTab => draft.suggestions.move_selection(-1),
+            KeyCode::Down => draft.suggestions.move_selection(1),
+            KeyCode::Tab => {
+                if let Some(path) = draft.suggestions.complete() {
+                    draft.input = path;
+                    draft.suggestions.update(&draft.input);
+                }
+            }
+            KeyCode::Enter => {
+                if draft.input.trim().is_empty() || draft.input == draft.start_directory {
+                    if draft.files.is_empty() {
+                        self.notice = Some("Add a file path first.".into());
+                    } else {
+                        draft.reviewing = true;
+                    }
+                } else if let ViewKind::Detail {
+                    course_id,
+                    assignment_id,
+                    ..
+                } = &kind
+                {
+                    if let Some(detail) = self
+                        .details
+                        .get(&(course_id.clone(), assignment_id.clone()))
+                        .and_then(|r| r.data.as_ref())
+                    {
+                        match submission::choose_file(&draft.input, detail, &draft.files) {
+                            Ok(file) => {
+                                draft.files.push(file);
+                                draft.input = draft.start_directory.clone();
+                                draft.suggestions.update(&draft.input);
+                            }
+                            Err(reason) => self.notice = Some(reason),
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && draft.input.chars().count() < 1024 =>
+            {
+                draft.input.push(c);
+                draft.suggestions.update(&draft.input);
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
     fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             self.quit = true;
             return vec![];
+        }
+        if self.submission.is_some() {
+            return self.on_submission_key(key);
+        }
+        if self.history_open {
+            return self.on_history_key(key);
         }
         let page = self.page() as isize;
         if self.view().filtering {
@@ -1630,6 +1973,12 @@ impl App {
                 assignment_id,
                 ..
             } => {
+                if key.code == KeyCode::Char('h') {
+                    return Some(self.open_history(&course_id, &assignment_id));
+                }
+                if key.code == KeyCode::Char('s') {
+                    return Some(self.start_submission(&course_id, &assignment_id));
+                }
                 let links = self.links_of(&course_id, &assignment_id);
                 let selected = self.view().link.filter(|&i| i < links.len());
                 match key.code {
@@ -1708,6 +2057,25 @@ impl App {
                 }
             }
             ViewKind::Courses => match key.code {
+                KeyCode::Char('E') => {
+                    self.editing_home = true;
+                    self.view_mut().selected = 0;
+                    self.view_mut().offset = 0;
+                    Some(vec![])
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if self.editing_home => {
+                    self.toggle_selected_course_hidden();
+                    Some(vec![])
+                }
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
+                    if self.editing_home =>
+                {
+                    self.editing_home = false;
+                    self.view_mut().selected = 0;
+                    self.view_mut().offset = 0;
+                    self.clamp_selection();
+                    Some(vec![])
+                }
                 KeyCode::Char('e') => {
                     let root = self.library.as_ref().map(|l| l.root().to_path_buf());
                     Some(self.reveal(root))
@@ -1715,6 +2083,27 @@ impl App {
                 _ => None,
             },
         }
+    }
+
+    fn toggle_selected_course_hidden(&mut self) {
+        let Some(&index) = self.visible_rows().get(self.view().selected) else {
+            return;
+        };
+        let Some(course) = self.courses.data.as_ref().and_then(|c| c.get(index)) else {
+            return;
+        };
+        let id = course.id.clone();
+        let title = course.title().to_string();
+        if self.hidden_courses.remove(&id) {
+            self.notice = Some(format!("Showing {title}."));
+        } else {
+            self.hidden_courses.insert(id);
+            self.notice = Some(format!("Hid {title}."));
+        }
+        if let Some(store) = &self.store {
+            store.save_hidden_courses(&self.hidden_courses);
+        }
+        self.clamp_selection();
     }
 
     /// Cycle course tabs; leaving Files leaves its nested folders.
@@ -2161,6 +2550,176 @@ mod tests {
         assert_eq!(app.courses.data.as_ref().unwrap().len(), 2);
         assert_eq!(app.courses.origin, Origin::Network);
         assert!(!app.current_syncing());
+    }
+
+    #[test]
+    fn file_submission_requires_review_and_explicit_yes() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        app.stack.push(View::new(ViewKind::Detail {
+            course_id: "10".into(),
+            course_name: "GPU".into(),
+            assignment_id: "20".into(),
+            title: "Lab".into(),
+        }));
+        let mut detail = AssignmentDetail::default();
+        detail.base.id = "20".into();
+        detail.base.submission_types = vec!["online_upload".into()];
+        let resource = app.details.entry(("10".into(), "20".into())).or_default();
+        resource.data = Some(detail);
+        resource.origin = Origin::Network;
+        resource.fetched_at = Some(Utc::now());
+        assert!(app.update(key(KeyCode::Char('s'))).is_empty());
+        assert!(app.submission.is_some());
+        let start = app.submission.as_ref().unwrap().start_directory.clone();
+        assert!(start.ends_with(std::path::MAIN_SEPARATOR));
+        assert_eq!(app.submission.as_ref().unwrap().input, start);
+        app.update(Msg::Paste("\"C:\\work\\lab.pdf\"".into()));
+        assert_eq!(
+            app.submission.as_ref().unwrap().input,
+            "\"C:\\work\\lab.pdf\""
+        );
+        for _ in 0..12 {
+            app.update(Msg::Key(KeyEvent::new_with_kind(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+                ratatui::crossterm::event::KeyEventKind::Repeat,
+            )));
+        }
+        assert_eq!(
+            app.submission.as_ref().unwrap().input,
+            "\"C:\\work\\lab.pdf\""
+        );
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(
+            app.submission.as_ref().unwrap().input,
+            "\"C:\\work\\lab.pdf"
+        );
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.submission.as_ref().unwrap().input.is_empty());
+        app.submission.as_mut().unwrap().input = start;
+        app.submission.as_mut().unwrap().files.push(FileChoice {
+            path: PathBuf::from("C:/work/lab.pdf"),
+            name: "lab.pdf".into(),
+            size: 7,
+        });
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(app.submission.as_ref().unwrap().reviewing);
+        assert!(app.update(key(KeyCode::Char('n'))).is_empty());
+        assert!(!app.submission.as_ref().unwrap().reviewing);
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(&app.update(key(KeyCode::Char('y')))[..],
+            [Effect::Submit { course_id, assignment_id, files }] if course_id == "10" && assignment_id == "20" && files.len() == 1));
+        assert!(app.update(key(KeyCode::Char('y'))).is_empty());
+    }
+
+    #[test]
+    fn past_submissions_fetch_only_when_opened_and_refresh_each_visit() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        app.stack.push(View::new(ViewKind::Detail {
+            course_id: "10".into(),
+            course_name: "GPU".into(),
+            assignment_id: "20".into(),
+            title: "Lab".into(),
+        }));
+        assert!(app.histories.is_empty());
+        let (key1, request1) = fetch_of(&app.update(key(KeyCode::Char('h'))));
+        assert_eq!(key1, ResourceKey::History("10".into(), "20".into()));
+        assert!(app.history_open);
+        let history = submission::History::parse(serde_json::json!({
+            "attempt": 2, "submitted_at": "2026-10-22T12:00:00Z",
+            "submission_history": [
+                {"attempt": 1, "submitted_at": "2026-10-20T12:00:00Z"},
+                {"attempt": 2, "submitted_at": "2026-10-22T12:00:00Z"}
+            ]
+        }))
+        .unwrap();
+        deliver(&mut app, key1, request1, Payload::History(history));
+        assert_eq!(
+            app.histories[&("10".into(), "20".into())]
+                .data
+                .as_ref()
+                .unwrap()
+                .attempts
+                .len(),
+            2
+        );
+        app.update(key(KeyCode::Right));
+        assert_eq!(app.history_selected, 1);
+        app.update(key(KeyCode::Esc));
+        assert!(!app.history_open);
+        let (key2, request2) = fetch_of(&app.update(key(KeyCode::Char('h'))));
+        assert_eq!(key2, ResourceKey::History("10".into(), "20".into()));
+        assert!(request2 > request1);
+    }
+
+    #[test]
+    fn hidden_courses_survive_refresh_and_restart_and_can_be_restored() {
+        let root =
+            std::env::temp_dir().join(format!("tuicanvas-hidden-courses-{}", std::process::id()));
+        let store = Arc::new(SnapshotStore::new(&root, "one"));
+        let mut app = App::new("https://ufl.instructure.com", Some(store.clone()));
+        let (k, r) = fetch_of(&app.start());
+        deliver(
+            &mut app,
+            k,
+            r,
+            Payload::Courses(vec![course("10", "GPU"), course("20", "Compilers")]),
+        );
+        assert!(app.update(key(KeyCode::Char('E'))).is_empty());
+        assert!(app.editing_home);
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.visible_rows(), [0, 1]);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.visible_rows(), [1]);
+        let (k, r) = fetch_of(&app.update(key(KeyCode::Char('r'))));
+        deliver(
+            &mut app,
+            k,
+            r,
+            Payload::Courses(vec![course("10", "GPU"), course("20", "Compilers")]),
+        );
+        assert_eq!(app.visible_rows(), [1]);
+        let mut restarted = App::new("https://ufl.instructure.com", Some(store));
+        let (k, r) = fetch_of(&restarted.start());
+        deliver(
+            &mut restarted,
+            k,
+            r,
+            Payload::Courses(vec![course("10", "GPU"), course("20", "Compilers")]),
+        );
+        assert_eq!(restarted.visible_rows(), [1]);
+        restarted.update(key(KeyCode::Char('E')));
+        assert_eq!(restarted.visible_rows(), [0, 1]);
+        restarted.update(key(KeyCode::Enter));
+        assert!(restarted.hidden_courses.is_empty());
+        restarted.update(key(KeyCode::Esc));
+        assert_eq!(restarted.visible_rows(), [0, 1]);
+        let other = App::new(
+            "https://ufl.instructure.com",
+            Some(Arc::new(SnapshotStore::new(&root, "other"))),
+        );
+        assert!(other.hidden_courses.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hiding_every_course_keeps_recovery_available() {
+        let mut app = app_with_courses();
+        app.update(key(KeyCode::Char('E')));
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Esc));
+        assert!(app.visible_rows().is_empty());
+        app.update(key(KeyCode::Char('E')));
+        assert_eq!(app.visible_rows(), [0, 1]);
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.hidden_courses.len(), 1);
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.visible_rows(), [0]);
     }
 
     #[test]
