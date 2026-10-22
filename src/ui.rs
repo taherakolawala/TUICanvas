@@ -709,9 +709,21 @@ fn draw_month(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>) 
     }
     lines.push(Line::from(names));
     let room = usize::from(area.height.saturating_sub(2 + strip));
-    let per_week = (room / weeks).max(1);
+    // Each week: a rule line, the day numbers, then entries.
+    let per_week = (room.saturating_sub(weeks) / weeks).max(1);
+    let week_rule = {
+        let mut text = String::from("─");
+        for i in 0..7 {
+            if i > 0 {
+                text.push('┼');
+            }
+            text.push_str(&"─".repeat(col - 1));
+        }
+        Line::styled(text, theme::faint())
+    };
     let item_lines = per_week - 1;
     for week in 0..weeks {
+        lines.push(week_rule.clone());
         let days: Vec<chrono::NaiveDate> = (0..7)
             .map(|d| start + chrono::Duration::days((week * 7 + d) as i64))
             .collect();
