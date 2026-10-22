@@ -10,10 +10,11 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, DetailRender, FileRow, Local as LocalFile, Origin, Resource, SyncState, ViewKind,
-    human_size,
+    App, DetailRender, FileRow, Local as LocalFile, Origin, Page, Resource, Section, SyncState,
+    ViewKind, human_size,
 };
 use crate::html::{self, Link, Target};
+use crate::keys;
 use crate::model::{AssignmentDetail, AssignmentSummary, CanvasFile, Tone, fmt_num};
 use crate::theme;
 
@@ -249,15 +250,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_top(frame, top, app, now);
     if app.submission.is_some() {
         draw_submission(frame, main, app, now);
-    } else if app.history_open {
-        if let ViewKind::Detail {
-            course_id,
-            assignment_id,
-            ..
-        } = app.view().kind.clone()
-        {
-            draw_history(frame, main, app, &course_id, &assignment_id);
-        }
     } else {
         match app.view().kind.clone() {
             ViewKind::Courses => draw_courses(frame, main, app),
@@ -279,27 +271,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 draw_tabs(frame, tabs, 2);
                 draw_announcements(frame, body, app, &course_id, now);
             }
-            ViewKind::Announcement {
-                course_id,
-                course_name,
-                announcement_id,
-                ..
-            } => draw_announcement(frame, main, app, &course_id, &announcement_id, &course_name),
-            ViewKind::Detail {
-                course_id,
-                course_name,
-                assignment_id,
-                ..
-            } => draw_detail(
-                frame,
-                main,
-                app,
-                &course_id,
-                &assignment_id,
-                &course_name,
-                now,
-            ),
+            ViewKind::Announcement { course_name, .. } | ViewKind::Detail { course_name, .. } => {
+                let page = app.view().kind.page().expect("a page view");
+                draw_page(frame, main, app, &page, &course_name, now)
+            }
         }
+    }
+    if app.menu.is_some() {
+        draw_menu(frame, main, app);
+    }
+    if app.help.is_some() {
+        draw_help(frame, main, app);
     }
     draw_footer(frame, bottom, app);
 }
@@ -350,8 +332,8 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     let mut crumbs = vec!["Canvas".to_string()];
     let (status, style) = match &app.view().kind {
         ViewKind::Courses => {
-            if app.editing_home {
-                crumbs.push("Edit home".into());
+            if app.show_hidden {
+                crumbs.push("Showing hidden courses".into());
             }
             sync_text(Some(&app.courses), app.spinner, now)
         }
@@ -393,21 +375,11 @@ fn draw_top(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         } => {
             crumbs.push(course_name.clone());
             crumbs.push(title.clone());
-            if app.history_open {
-                crumbs.push("Past submissions".into());
-                sync_text(
-                    app.histories
-                        .get(&(course_id.clone(), assignment_id.clone())),
-                    app.spinner,
-                    now,
-                )
-            } else {
-                sync_text(
-                    app.details.get(&(course_id.clone(), assignment_id.clone())),
-                    app.spinner,
-                    now,
-                )
-            }
+            sync_text(
+                app.details.get(&(course_id.clone(), assignment_id.clone())),
+                app.spinner,
+                now,
+            )
         }
         ViewKind::Files {
             course_id,
@@ -485,7 +457,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw("  "),
         ]
         .into_iter()
-        .chain(hint_spans(&[("Enter", "keep"), ("Esc", "clear")]))
+        .chain({
+            let hints = keys::hint_line(&app.scopes(), &|_| true, usize::from(area.width));
+            let pairs: Vec<(&str, &str)> = hints.iter().map(|(k, l)| (k.as_str(), *l)).collect();
+            hint_spans(&pairs)
+        })
         .collect()
     } else if app.login_required {
         vec![Span::styled(
@@ -494,123 +470,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         )]
     } else if let Some(notice) = &app.notice {
         vec![Span::styled(notice.clone(), theme::notice())]
-    } else if app.history_open {
-        hint_spans(&[
-            ("←/→", "attempt"),
-            ("↑/↓", "scroll"),
-            ("r", "refresh"),
-            ("Esc", "assignment"),
-        ])
-    } else if let Some(draft) = &app.submission {
-        let hints = if draft.busy {
-            &[("", "Uploading and verifying on Canvas…")][..]
-        } else if draft.reviewing {
-            &[("y", "submit now"), ("n/Esc", "edit files")][..]
-        } else {
-            &[
-                ("↑↓", "suggestions"),
-                ("Tab", "complete"),
-                ("Ctrl+U", "clear path"),
-                ("Enter", "add / review"),
-                ("Esc", "cancel"),
-            ][..]
-        };
-        hint_spans(hints)
+    } else if app.submission.as_ref().is_some_and(|d| d.busy) {
+        hint_spans(&[("", "Uploading and verifying on Canvas…")])
     } else {
-        let hints: &[(&str, &str)] = match view.kind {
-            ViewKind::Courses if app.editing_home => {
-                &[("↑↓", "move"), ("Enter", "hide/restore"), ("Esc", "done")]
-            }
-            ViewKind::Courses => &[
-                ("↑↓", "move"),
-                ("Enter", "open"),
-                ("E", "edit home"),
-                ("e", "your files"),
-                ("/", "filter"),
-                ("r", "refresh"),
-                ("o", "browser"),
-                ("q", "quit"),
-            ],
-            ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => &[
-                ("↑↓", "move"),
-                ("Enter", "open"),
-                ("Tab", "switch"),
-                ("Esc", "back"),
-                ("/", "filter"),
-                ("r", "refresh"),
-                ("o", "browser"),
-                ("q", "quit"),
-            ],
-            ViewKind::Files { .. } => &[
-                ("Enter", "open"),
-                ("d", "download"),
-                ("D", "all"),
-                ("e", "folder"),
-                ("/", "search"),
-                ("Tab", "switch"),
-                ("Esc", "back"),
-                ("o", "browser"),
-                ("r", "refresh"),
-            ],
-            ViewKind::Announcement { .. } => &[
-                ("↑↓", "scroll"),
-                ("Tab", "links"),
-                ("Enter", "open"),
-                ("d/D", "download"),
-                ("Esc", "back"),
-                ("r", "refresh"),
-                ("o", "browser"),
-                ("q", "quit"),
-            ],
-            ViewKind::Detail {
-                ref course_id,
-                ref assignment_id,
-                ..
-            } if !app.links_of(course_id, assignment_id).is_empty() => {
-                if view.link.is_some() {
-                    &[
-                        ("Tab", "next"),
-                        ("Enter", "open"),
-                        ("d", "download"),
-                        ("D", "all files"),
-                        ("s", "submit"),
-                        ("h", "past submissions"),
-                        ("e", "show folder"),
-                        ("o", "browser"),
-                        ("Esc", "done"),
-                        ("↑↓", "scroll"),
-                    ]
-                } else {
-                    &[
-                        ("↑↓", "scroll"),
-                        ("Tab", "files & links"),
-                        ("D", "download files"),
-                        ("s", "submit"),
-                        ("h", "past submissions"),
-                        ("Esc", "back"),
-                        ("r", "refresh"),
-                        ("o", "open in browser"),
-                        ("q", "quit"),
-                    ]
-                }
-            }
-            ViewKind::Detail { .. } => &[
-                ("↑↓", "scroll"),
-                ("s", "submit"),
-                ("h", "past submissions"),
-                ("Esc", "back"),
-                ("r", "refresh"),
-                ("o", "open in browser"),
-                ("q", "quit"),
-            ],
-        };
+        // From the key table: the most useful keys here that fit.
+        let scopes = app.scopes();
+        let budget = usize::from(area.width).saturating_sub(2);
+        let hints = keys::hint_line(&scopes, &|a| app.available(a), budget);
+        let pairs: Vec<(&str, &str)> = hints.iter().map(|(k, l)| (k.as_str(), *l)).collect();
         let mut spans = Vec::new();
-        if !view.filter.is_empty() {
+        if !view.filter.is_empty() && !view.filtering {
             spans.push(Span::styled("filter ", theme::muted()));
             spans.push(Span::styled(view.filter.clone(), theme::code()));
             spans.push(Span::raw("  "));
         }
-        spans.extend(hint_spans(hints));
+        spans.extend(hint_spans(&pairs));
         spans
     };
     let (queued, running) = app.transfer_counts();
@@ -716,12 +590,12 @@ fn draw_courses(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let rows = app.visible_rows();
     if rows.is_empty() {
-        if !app.editing_home
+        if !app.show_hidden
             && app.view().filter.is_empty()
             && app.courses.data.as_ref().is_some_and(|c| !c.is_empty())
         {
             frame.render_widget(
-                Paragraph::new("All courses are hidden. Press E to edit home and restore them.")
+                Paragraph::new("All courses are hidden. Press Space, then H, to show them again.")
                     .style(theme::muted())
                     .alignment(Alignment::Center),
                 Rect {
@@ -1240,69 +1114,6 @@ fn link_row(app: &App, link: &Link) -> (String, String, String, (String, Style))
     }
 }
 
-fn draw_links(frame: &mut Frame, area: Rect, app: &App, links: &[Link], selected: Option<usize>) {
-    let [title, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    let mut head = vec![Span::styled(
-        format!(" Files & links ({})", links.len()),
-        theme::heading(),
-    )];
-    if selected.is_none() {
-        head.push(Span::styled("  Tab", theme::key()));
-        head.push(Span::styled(" to select", theme::faint()));
-    }
-    let rule = usize::from(area.width)
-        .saturating_sub(head.iter().map(|s| s.content.width()).sum::<usize>() + 1);
-    head.push(Span::styled(
-        format!(" {}", "─".repeat(rule)),
-        theme::faint(),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(head)), title);
-    let height = usize::from(list.height).max(1);
-    let offset = selected
-        .map(|s| s.saturating_sub(height - 1))
-        .unwrap_or(0)
-        .min(links.len().saturating_sub(height));
-    let rows: Vec<Row> = links
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(height)
-        .map(|(i, link)| {
-            let (kind, name, size, (state, style)) = link_row(app, link);
-            let row = Row::new(vec![
-                Cell::from(format!("{:>2}", i + 1)).style(theme::key()),
-                Cell::from(kind).style(theme::code()),
-                Cell::from(html::sanitize(&name)),
-                Cell::from(size).style(theme::muted()),
-                Cell::from(html::sanitize(&state)).style(style),
-            ]);
-            if Some(i) == selected {
-                row.style(theme::selected())
-            } else {
-                row
-            }
-        })
-        .collect();
-    let widths = if area.width >= 70 {
-        vec![
-            Constraint::Length(2),
-            Constraint::Length(4),
-            Constraint::Fill(1),
-            Constraint::Length(9),
-            Constraint::Length(18),
-        ]
-    } else {
-        vec![
-            Constraint::Length(2),
-            Constraint::Length(4),
-            Constraint::Fill(1),
-            Constraint::Length(0),
-            Constraint::Length(10),
-        ]
-    };
-    frame.render_widget(Table::new(rows, widths).column_spacing(1), list);
-}
-
 fn detail_header(d: &AssignmentDetail, course: &str, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let a = &d.base;
     let label = |s: &str| Span::styled(format!("{s:<12}"), theme::muted());
@@ -1493,275 +1304,260 @@ pub fn style_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_detail(
-    frame: &mut Frame,
-    area: Rect,
-    app: &mut App,
-    course_id: &str,
-    assignment_id: &str,
-    course: &str,
-    now: DateTime<Utc>,
-) {
-    let key = (course_id.to_string(), assignment_id.to_string());
-    if placeholder(frame, area, app.details.get(&key), "assignment") {
-        return;
-    }
-    // Files and links get a fixed list at the bottom, so they stay in view while reading.
-    let links = app.links_of(course_id, assignment_id);
-    let area = if links.is_empty() {
-        area
-    } else {
-        let cap = if area.height >= 24 {
-            6
-        } else if area.height >= 16 {
-            4
-        } else {
-            2
-        };
-        let rows = links.len().min(cap) as u16;
-        let [text, panel] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(rows + 1)]).areas(area);
-        let selected = app.view().link.filter(|&i| i < links.len());
-        draw_links(frame, panel, app, &links, selected);
-        text
-    };
-    let res = &app.details[&key];
-    let detail = res.data.as_ref().expect("checked");
-    let text_width = area.width.saturating_sub(2).min(110);
-    let stale = !matches!(&app.detail_render, Some(r) if r.key == key && r.version == res.version && r.width == text_width);
-    if stale {
-        let lines = html::render(
-            detail.description.as_deref().unwrap_or(""),
-            usize::from(text_width),
-            &app.origin,
-        );
-        app.detail_render = Some(DetailRender {
-            key: key.clone(),
-            version: res.version,
-            width: text_width,
-            lines,
-        });
-    }
-    let mut lines = detail_header(detail, course, now);
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "─".repeat(usize::from(text_width)),
-        theme::faint(),
-    ));
-    let head_len = lines.len();
-    let body = &app.detail_render.as_ref().expect("rendered").lines;
-    let body_len = body.len().max(1);
-    let height = usize::from(area.height);
-    let max_scroll = (head_len + body_len).saturating_sub(height);
-    let view = app.stack.last_mut().expect("view");
-    view.scroll = view.scroll.min(max_scroll);
-    let scroll = view.scroll;
-    let mut visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
-    let body_start = scroll.saturating_sub(head_len);
-    let room = height - visible.len();
-    if body.is_empty() {
-        if room > 0 && scroll <= head_len {
-            visible.push(Line::styled("(No description)", theme::muted()));
-        }
-    } else {
-        visible.extend(
-            body.iter()
-                .skip(body_start)
-                .take(room)
-                .map(|l| style_line(l)),
-        );
-    }
-    let inner = Rect {
-        x: area.x + 1,
-        width: area.width.saturating_sub(1),
-        ..area
-    };
-    frame.render_widget(Paragraph::new(visible), inner);
+/// One line of a page: built ahead, or a line of the converted text, styled
+/// only when it is on screen.
+enum PageRow {
+    Line(Line<'static>),
+    Body(usize),
 }
 
-fn draw_history(
-    frame: &mut Frame,
-    area: Rect,
+/// Where each section and selectable entry starts, to keep the focused one in view.
+#[derive(Default)]
+struct Anchors {
+    links: Option<usize>,
+    link_rows: Vec<usize>,
+    submissions: Option<usize>,
+    attempt_rows: Vec<usize>,
+}
+
+/// `text` cut or padded to exactly `width` columns.
+fn pad(text: &str, width: usize) -> String {
+    let cut = truncate(text, width);
+    let used = cut.width();
+    cut + &" ".repeat(width.saturating_sub(used))
+}
+
+fn section_heading(title: String, focused: bool, width: usize) -> Line<'static> {
+    let style = if focused {
+        theme::tab_active()
+    } else {
+        theme::heading()
+    };
+    let rule = width.saturating_sub(title.width() + 1);
+    Line::from(vec![
+        Span::styled(title, style),
+        Span::styled(format!(" {}", "─".repeat(rule)), theme::faint()),
+    ])
+}
+
+/// The page's converted text (description or message).
+fn page_body<'a>(app: &'a App, page: &Page) -> &'a [String] {
+    let render = match page {
+        Page::Assignment(..) => app.detail_render.as_ref(),
+        Page::Announcement(..) => app.announcement_render.as_ref(),
+    };
+    render.map(|r| r.lines.as_slice()).unwrap_or(&[])
+}
+
+fn link_rows(
+    app: &App,
+    links: &[Link],
+    focused: bool,
+    selected: usize,
+    width: usize,
+    rows: &mut Vec<PageRow>,
+    anchors: &mut Anchors,
+) {
+    rows.push(PageRow::Line(Line::raw("")));
+    anchors.links = Some(rows.len());
+    rows.push(PageRow::Line(section_heading(
+        format!("Files & links ({})", links.len()),
+        focused,
+        width,
+    )));
+    let wide = width >= 70;
+    let (size_w, state_w) = if wide { (9, 18) } else { (0, 10) };
+    let name_w = width.saturating_sub(3 + 5 + if wide { size_w + 1 } else { 0 } + state_w + 1);
+    for (i, link) in links.iter().enumerate() {
+        let (kind, name, size, (state, state_style)) = link_row(app, link);
+        let mut spans = vec![
+            Span::styled(format!("{:>2} ", i + 1), theme::key()),
+            Span::styled(pad(&kind, 4) + " ", theme::code()),
+            Span::raw(pad(&html::sanitize(&name), name_w) + " "),
+        ];
+        if wide {
+            spans.push(Span::styled(
+                format!("{:>width$} ", truncate(&size, size_w), width = size_w),
+                theme::muted(),
+            ));
+        }
+        spans.push(Span::styled(
+            pad(&html::sanitize(&state), state_w),
+            state_style,
+        ));
+        let mut line = Line::from(spans);
+        if focused && i == selected {
+            line = line.style(theme::selected());
+        }
+        anchors.link_rows.push(rows.len());
+        rows.push(PageRow::Line(line));
+    }
+}
+
+/// Converted text of the selected attempt, cached like descriptions.
+fn update_attempt_render(
     app: &mut App,
     course_id: &str,
     assignment_id: &str,
+    selected: usize,
+    width: u16,
 ) {
     let key = (course_id.to_string(), assignment_id.to_string());
-    if placeholder(frame, area, app.histories.get(&key), "submission history") {
+    let Some(res) = app.histories.get(&key) else {
         return;
-    }
-    let res = &app.histories[&key];
-    let history = res.data.as_ref().expect("checked");
-    if history.attempts.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No past submissions for this assignment."),
-            area,
-        );
+    };
+    let Some(attempt) = res.data.as_ref().and_then(|h| h.attempts.get(selected)) else {
         return;
-    }
-    let selected = app.history_selected.min(history.attempts.len() - 1);
-    let attempt = &history.attempts[selected];
-    let width = area.width.saturating_sub(2).min(110);
-    let stale = !matches!(&app.history_render, Some(r)
+    };
+    let fresh = matches!(&app.history_render, Some(r)
         if r.key == key && r.version == res.version && r.selected == selected && r.width == width);
-    if stale {
+    if !fresh {
+        let lines = attempt
+            .body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())
+            .map(|body| html::render(body, usize::from(width).saturating_sub(4), &app.origin))
+            .unwrap_or_default();
         app.history_render = Some(crate::app::HistoryRender {
-            key: key.clone(),
+            key,
             version: res.version,
             selected,
             width,
-            lines: attempt
-                .body
-                .as_deref()
-                .filter(|body| !body.trim().is_empty())
-                .map(|body| html::render(body, usize::from(width), &app.origin))
-                .unwrap_or_default(),
+            lines,
         });
     }
-    let mut lines = vec![
-        Line::styled("Past submissions", theme::heading()),
-        Line::from(vec![
-            Span::styled(
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submission_rows(
+    app: &App,
+    course_id: &str,
+    assignment_id: &str,
+    focused: bool,
+    selected: usize,
+    width: usize,
+    now: DateTime<Utc>,
+    rows: &mut Vec<PageRow>,
+    anchors: &mut Anchors,
+) {
+    let res = app
+        .histories
+        .get(&(course_id.to_string(), assignment_id.to_string()));
+    let attempts = res
+        .and_then(|r| r.data.as_ref())
+        .map(|h| h.attempts.as_slice())
+        .unwrap_or(&[]);
+    rows.push(PageRow::Line(Line::raw("")));
+    anchors.submissions = Some(rows.len());
+    let title = if attempts.is_empty() {
+        "Submissions".to_string()
+    } else {
+        format!("Submissions ({})", attempts.len())
+    };
+    rows.push(PageRow::Line(section_heading(title, focused, width)));
+    if attempts.is_empty() {
+        let (text, style) = match res.map(|r| &r.sync) {
+            Some(SyncState::Syncing { .. }) => {
+                ("Loading past submissions…".to_string(), theme::muted())
+            }
+            Some(SyncState::Failed(e)) => (
                 format!(
-                    "Attempt {}  ·  {} of {}{}",
-                    attempt
-                        .attempt
-                        .unwrap_or((history.attempts.len() - selected) as i64),
-                    selected + 1,
-                    history.attempts.len(),
-                    if selected == 0 { "  ·  latest" } else { "" }
+                    "Could not load past submissions: {}. Press r to retry.",
+                    e.describe()
                 ),
-                theme::bold(),
+                theme::error(),
             ),
-            Span::styled("  ← newer  → older", theme::muted()),
-        ]),
-        Line::from(format!(
-            "Submitted: {}",
+            _ => ("Nothing submitted yet.".to_string(), theme::muted()),
+        };
+        rows.push(PageRow::Line(Line::styled(text, style)));
+        return;
+    }
+    let indent = "    ";
+    for (i, attempt) in attempts.iter().enumerate() {
+        let number = attempt.attempt.unwrap_or((attempts.len() - i) as i64);
+        let mut parts = vec![format!("Attempt {number}")];
+        parts.push(
             attempt
                 .submitted_at
-                .map(long_date)
-                .unwrap_or_else(|| "Unknown".into())
-        )),
-    ];
-    if let Some(kind) = &attempt.submission_type {
-        lines.push(Line::from(format!("Type: {}", submission_type(kind))));
-    }
-    if let Some(state) = &attempt.workflow_state {
-        lines.push(Line::from(format!(
-            "Status: {}{}",
-            html::sanitize(state),
-            if attempt.late == Some(true) {
-                " · late"
-            } else {
-                ""
-            }
-        )));
-    }
-    if let Some(grade) = &attempt.grade {
-        lines.push(Line::from(format!("Grade: {}", html::sanitize(grade))));
-    } else if let Some(score) = attempt.score {
-        lines.push(Line::from(format!("Score: {}", fmt_num(score))));
-    }
-    if let Some(url) = &attempt.url {
-        lines.push(Line::from(format!(
-            "Submitted URL: {}",
-            truncate(&html::sanitize(url), usize::from(width).saturating_sub(15))
-        )));
-    }
-    if !attempt.attachments.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("Files", theme::heading()));
+                .map(|at| short_date(at, now))
+                .unwrap_or_else(|| "date unknown".into()),
+        );
+        if let Some(state) = &attempt.workflow_state {
+            parts.push(html::sanitize(state).replace('_', " "));
+        }
+        if let Some(grade) = &attempt.grade {
+            parts.push(format!("grade {}", html::sanitize(grade)));
+        } else if let Some(score) = attempt.score {
+            parts.push(format!("score {}", fmt_num(score)));
+        }
+        if attempt.late == Some(true) {
+            parts.push("late".into());
+        }
+        if !attempt.attachments.is_empty() {
+            let n = attempt.attachments.len();
+            parts.push(format!("{n} file{}", if n == 1 { "" } else { "s" }));
+        }
+        if i == 0 {
+            parts.push("latest".into());
+        }
+        let mut line = Line::from(Span::raw(pad(&format!(" {}", parts.join(" · ")), width)));
+        if focused && i == selected {
+            line = line.style(theme::selected());
+        } else if i == selected {
+            line = line.style(theme::bold());
+        }
+        anchors.attempt_rows.push(rows.len());
+        rows.push(PageRow::Line(line));
+        if i != selected {
+            continue;
+        }
+        // The selected attempt, in full.
+        if let Some(kind) = &attempt.submission_type {
+            rows.push(PageRow::Line(Line::styled(
+                format!("{indent}Type: {}", submission_type(kind)),
+                theme::muted(),
+            )));
+        }
+        if let Some(url) = &attempt.url {
+            rows.push(PageRow::Line(Line::from(format!(
+                "{indent}Submitted URL: {}",
+                truncate(&html::sanitize(url), width.saturating_sub(20))
+            ))));
+        }
         for file in &attempt.attachments {
             let size = file
                 .size
                 .map(|n| format!(" ({})", human_size(n)))
                 .unwrap_or_default();
-            lines.push(Line::from(format!(
-                "  • {}{}",
+            rows.push(PageRow::Line(Line::from(format!(
+                "{indent}• {}{}",
                 truncate(
                     &html::sanitize(file.name()),
-                    usize::from(width).saturating_sub(size.len() + 4)
+                    width.saturating_sub(size.len() + 6)
                 ),
                 size
-            )));
+            ))));
+        }
+        let text = app
+            .history_render
+            .as_ref()
+            .filter(|r| r.key.0 == course_id && r.key.1 == assignment_id && r.selected == selected)
+            .map(|r| r.lines.as_slice())
+            .unwrap_or(&[]);
+        for line in text {
+            let mut styled = style_line(line);
+            styled.spans.insert(0, Span::raw(indent));
+            rows.push(PageRow::Line(styled));
         }
     }
-    let body = &app.history_render.as_ref().expect("rendered").lines;
-    if !body.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("Text", theme::heading()));
-        lines.extend(body.iter().map(|line| style_line(line)));
-    }
-    let height = usize::from(area.height);
-    app.history_scroll = app.history_scroll.min(lines.len().saturating_sub(height));
-    let visible: Vec<Line> = lines
-        .into_iter()
-        .skip(app.history_scroll)
-        .take(height)
-        .collect();
-    let inner = Rect {
-        x: area.x + 1,
-        width: area.width.saturating_sub(1),
-        ..area
-    };
-    frame.render_widget(Paragraph::new(visible), inner);
 }
 
-fn draw_announcement(
-    frame: &mut Frame,
-    area: Rect,
-    app: &mut App,
+fn announcement_header(
+    app: &App,
     course_id: &str,
-    announcement_id: &str,
+    detail: &crate::announcements::Detail,
     course: &str,
-) {
-    let key = (course_id.to_string(), announcement_id.to_string());
-    if placeholder(
-        frame,
-        area,
-        app.announcement_details.get(&key),
-        "announcement",
-    ) {
-        return;
-    }
-    // Files and links get a fixed list at the bottom, so they stay in view while reading.
-    let links = app.announcement_links(course_id, announcement_id);
-    let area = if links.is_empty() {
-        area
-    } else {
-        let cap = if area.height >= 24 {
-            6
-        } else if area.height >= 16 {
-            4
-        } else {
-            2
-        };
-        let rows = links.len().min(cap) as u16;
-        let [text, panel] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(rows + 1)]).areas(area);
-        let selected = app.view().link.filter(|&i| i < links.len());
-        draw_links(frame, panel, app, &links, selected);
-        text
-    };
-    let res = &app.announcement_details[&key];
-    let detail = res.data.as_ref().expect("checked");
-    let text_width = area.width.saturating_sub(2).min(110);
-    let stale = !matches!(&app.announcement_render, Some(r) if r.key == key && r.version == res.version && r.width == text_width);
-    if stale {
-        let lines = html::render(
-            // Canvas already returns a visibility explanation instead of the
-            // message when access is restricted. A comment lock is not a read lock.
-            detail.message.as_deref().unwrap_or(""),
-            usize::from(text_width),
-            &app.origin,
-        );
-        app.announcement_render = Some(DetailRender {
-            key: key.clone(),
-            version: res.version,
-            width: text_width,
-            lines,
-        });
-    }
+) -> Vec<Line<'static>> {
     let a = &detail.base;
     let mut lines = vec![
         Line::styled(html::sanitize(a.title()), theme::tab_active()),
@@ -1796,40 +1592,319 @@ fn draw_announcement(
             },
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "─".repeat(usize::from(text_width)),
-        theme::faint(),
-    ));
-    let head_len = lines.len();
-    let body = &app.announcement_render.as_ref().expect("rendered").lines;
-    let body_len = body.len().max(1);
-    let height = usize::from(area.height);
-    let max_scroll = (head_len + body_len).saturating_sub(height);
-    let view = app.stack.last_mut().expect("view");
-    view.scroll = view.scroll.min(max_scroll);
-    let scroll = view.scroll;
-    let mut visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
-    let body_start = scroll.saturating_sub(head_len);
-    let room = height - visible.len();
-    if body.is_empty() {
-        if room > 0 && scroll <= head_len {
-            visible.push(Line::styled("(No message)", theme::muted()));
+    lines
+}
+
+/// An assignment or announcement: its details, its text, then its files &
+/// links and (for assignments) past submissions, all in one scrolling page.
+/// `Tab` moves the focus between those sections.
+fn draw_page(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    page: &Page,
+    course: &str,
+    now: DateTime<Utc>,
+) {
+    let text_width = area.width.saturating_sub(2).min(110);
+    let width = usize::from(text_width);
+    // The page's own read, and its text converted once per version and width.
+    let (header, empty) = match page {
+        Page::Assignment(c, a) => {
+            let key = (c.clone(), a.clone());
+            if placeholder(frame, area, app.details.get(&key), "assignment") {
+                return;
+            }
+            let res = &app.details[&key];
+            let stale = !matches!(&app.detail_render, Some(r)
+                if r.key == key && r.version == res.version && r.width == text_width);
+            if stale {
+                let lines = html::render(
+                    res.data
+                        .as_ref()
+                        .and_then(|d| d.description.as_deref())
+                        .unwrap_or(""),
+                    width,
+                    &app.origin,
+                );
+                app.detail_render = Some(DetailRender {
+                    key: key.clone(),
+                    version: res.version,
+                    width: text_width,
+                    lines,
+                });
+            }
+            let detail = app.details[&key].data.as_ref().expect("checked");
+            (detail_header(detail, course, now), "(No description)")
         }
+        Page::Announcement(c, a) => {
+            let key = (c.clone(), a.clone());
+            if placeholder(
+                frame,
+                area,
+                app.announcement_details.get(&key),
+                "announcement",
+            ) {
+                return;
+            }
+            let res = &app.announcement_details[&key];
+            let stale = !matches!(&app.announcement_render, Some(r)
+                if r.key == key && r.version == res.version && r.width == text_width);
+            if stale {
+                // Canvas returns a visibility explanation instead of the message
+                // when access is restricted. A comment lock is not a read lock.
+                let lines = html::render(
+                    res.data
+                        .as_ref()
+                        .and_then(|d| d.message.as_deref())
+                        .unwrap_or(""),
+                    width,
+                    &app.origin,
+                );
+                app.announcement_render = Some(DetailRender {
+                    key: key.clone(),
+                    version: res.version,
+                    width: text_width,
+                    lines,
+                });
+            }
+            let detail = app.announcement_details[&key]
+                .data
+                .as_ref()
+                .expect("checked");
+            (announcement_header(app, c, detail, course), "(No message)")
+        }
+    };
+    let focus = app.focus();
+    let (selected_link, selected_attempt) = (app.view().link, app.view().attempt);
+    if let Page::Assignment(c, a) = page {
+        update_attempt_render(app, c, a, selected_attempt, text_width);
+    }
+    let mut rows: Vec<PageRow> = header.into_iter().map(PageRow::Line).collect();
+    rows.push(PageRow::Line(Line::raw("")));
+    rows.push(PageRow::Line(Line::styled(
+        "─".repeat(width),
+        theme::faint(),
+    )));
+    let body_len = page_body(app, page).len();
+    if body_len == 0 {
+        rows.push(PageRow::Line(Line::styled(empty, theme::muted())));
     } else {
-        visible.extend(
-            body.iter()
-                .skip(body_start)
-                .take(room)
-                .map(|l| style_line(l)),
+        rows.extend((0..body_len).map(PageRow::Body));
+    }
+    let mut anchors = Anchors::default();
+    let links = app.page_links(page);
+    if !links.is_empty() {
+        link_rows(
+            app,
+            &links,
+            focus == Section::Links,
+            selected_link,
+            width,
+            &mut rows,
+            &mut anchors,
         );
     }
+    if let Page::Assignment(c, a) = page {
+        submission_rows(
+            app,
+            c,
+            a,
+            focus == Section::Submissions,
+            selected_attempt,
+            width,
+            now,
+            &mut rows,
+            &mut anchors,
+        );
+    }
+    // Keep the focused section and its selection in view.
+    let height = usize::from(area.height);
+    let max_scroll = rows.len().saturating_sub(height);
+    let view = app.stack.last_mut().expect("view stack is never empty");
+    if std::mem::take(&mut view.reveal) {
+        let start = match focus {
+            Section::Links => anchors.links,
+            Section::Submissions => anchors.submissions,
+            Section::Text => None,
+        };
+        if let Some(start) = start {
+            view.scroll = start;
+        }
+    }
+    match focus {
+        Section::Links => {
+            if let Some(&row) = anchors.link_rows.get(view.link) {
+                if row < view.scroll {
+                    view.scroll = row.saturating_sub(1);
+                } else if row >= view.scroll + height {
+                    view.scroll = row + 1 - height;
+                }
+            }
+        }
+        Section::Submissions => {
+            // The selected attempt's details follow its row, so put the row near the top.
+            if let Some(&row) = anchors.attempt_rows.get(view.attempt)
+                && (row < view.scroll || row >= view.scroll + height)
+            {
+                view.scroll = row.saturating_sub(1);
+            }
+        }
+        Section::Text => {}
+    }
+    view.scroll = view.scroll.min(max_scroll);
+    let scroll = view.scroll;
+    let body = page_body(app, page);
+    let visible: Vec<Line> = rows
+        .into_iter()
+        .skip(scroll)
+        .take(height)
+        .map(|row| match row {
+            PageRow::Line(line) => line,
+            PageRow::Body(i) => style_line(&body[i]),
+        })
+        .collect();
     let inner = Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(1),
         ..area
     };
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+/// A box in the middle of `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The actions menu: what can be done with the selection and on this screen,
+/// each with the letter that runs it.
+fn draw_menu(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(menu) = &app.menu else {
+        return;
+    };
+    let entries = app.menu_entries();
+    let mut lines: Vec<Line> = vec![match &menu.search {
+        Some(text) => Line::from(vec![
+            Span::styled("/", theme::key()),
+            Span::styled(text.clone(), theme::bold()),
+            Span::styled("▏", theme::key()),
+        ]),
+        None => Line::from(vec![
+            Span::styled("letter", theme::key()),
+            Span::styled(" runs it · ", theme::faint()),
+            Span::styled("/", theme::key()),
+            Span::styled(" search", theme::faint()),
+        ]),
+    }];
+    let mut selected_line = 0;
+    let mut group = None;
+    for (i, entry) in entries.iter().enumerate() {
+        if group != Some(entry.group) {
+            group = Some(entry.group);
+            lines.push(Line::styled(entry.group.title(), theme::muted()));
+        }
+        let letter = entry.menu.map(|c| c.to_string()).unwrap_or_default();
+        let mut line = Line::from(vec![
+            Span::styled(format!("  {letter:<2} "), theme::key()),
+            Span::raw(app.title_of(entry)),
+        ]);
+        if i == menu.selected {
+            line = line.style(theme::selected());
+            selected_line = lines.len();
+        }
+        lines.push(line);
+    }
+    if entries.is_empty() {
+        lines.push(Line::styled("  No matching actions", theme::muted()));
+    }
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(20)
+        .clamp(30, 56) as u16
+        + 6;
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = centered(area, width, height);
+    let inner_height = usize::from(rect.height.saturating_sub(2));
+    let skip = (selected_line + 1).saturating_sub(inner_height);
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()).block(
+            ratatui::widgets::Block::bordered()
+                .title(" Actions ")
+                .border_style(theme::accent())
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        rect,
+    );
+}
+
+/// `?`: every key that works here and every action in the menu, from the key table.
+fn draw_help(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(scroll) = app.help else {
+        return;
+    };
+    let screen = app.screen_scopes();
+    let mut lines: Vec<Line> = vec![Line::styled("Keys on this screen", theme::heading())];
+    let row = |keys: String, title: String| {
+        Line::from(vec![
+            Span::styled(format!("  {keys:<22}"), theme::key()),
+            Span::raw(title),
+        ])
+    };
+    let here = keys::here(&screen);
+    for b in here.iter().filter(|b| !b.keys.is_empty()) {
+        lines.push(row(keys::show_all(b), app.title_of(b)));
+    }
+    let menu_only: Vec<_> = keys::menu(&screen, &|_| true)
+        .into_iter()
+        .filter(|m| !here.iter().any(|b| b.act == m.act && !b.keys.is_empty()))
+        .collect();
+    if !menu_only.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "In the actions menu (Space, then the letter)",
+            theme::heading(),
+        ));
+        for b in menu_only {
+            lines.push(row(
+                b.menu.map(|c| c.to_string()).unwrap_or_default(),
+                app.title_of(b),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Everywhere", theme::heading()));
+    for text in [
+        "↑↓ move · Enter open · Esc back · Tab next tab or section · / search",
+        "r refresh · o browser · Space actions · ? this help · q quit",
+        "In text boxes, letters are text; Enter keeps, Esc cancels, Tab completes a path.",
+    ] {
+        lines.push(Line::styled(format!("  {text}"), theme::muted()));
+    }
+    let rect = centered(area, area.width.saturating_sub(4).min(90), area.height);
+    let inner = usize::from(rect.height.saturating_sub(2));
+    let scroll = scroll.min(lines.len().saturating_sub(inner));
+    app.help = Some(scroll);
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(scroll).collect::<Vec<_>>()).block(
+            ratatui::widgets::Block::bordered()
+                .title(" Keys · Esc to close ")
+                .border_style(theme::accent())
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        rect,
+    );
 }
 
 #[cfg(test)]
@@ -1969,23 +2044,105 @@ mod tests {
                 ..Default::default()
             }]),
         );
-        app.update(Msg::Key(KeyEvent::new(
-            KeyCode::Char('E'),
-            KeyModifiers::NONE,
-        )));
-        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(screen(&mut app, 90, 14).contains("Press E to edit home"));
-        app.update(Msg::Key(KeyEvent::new(
-            KeyCode::Char('E'),
-            KeyModifiers::NONE,
-        )));
+        let press = |app: &mut App, c: char| {
+            app.update(Msg::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        };
+        press(&mut app, ' ');
+        let menu = screen(&mut app, 90, 20);
+        assert!(
+            menu.contains("Actions") && menu.contains("Hide this course"),
+            "{menu}"
+        );
+        press(&mut app, 'h');
+        assert!(screen(&mut app, 90, 14).contains("Press Space, then H"));
+        press(&mut app, ' ');
+        press(&mut app, 'H');
         let rendered = screen(&mut app, 90, 14);
-        assert!(rendered.contains("Edit home") && rendered.contains("Only course [hidden]"));
-        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(
+            rendered.contains("Showing hidden courses")
+                && rendered.contains("Only course [hidden]"),
+            "{rendered}"
+        );
+        press(&mut app, ' ');
+        assert!(screen(&mut app, 90, 20).contains("Restore this course"));
+        press(&mut app, 'h');
         app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(screen(&mut app, 90, 14).contains("Only course"));
         assert!(app.hidden_courses.is_empty());
+    }
+
+    #[test]
+    fn actions_menu_and_help_come_from_the_key_table() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        let effects = app.start();
+        deliver(
+            &mut app,
+            effects,
+            Payload::Courses(vec![Course {
+                id: "1".into(),
+                name: Some("GPU Computing".into()),
+                ..Default::default()
+            }]),
+        );
+        let send = |app: &mut App, code: KeyCode| {
+            app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        };
+        send(&mut app, KeyCode::Char(' '));
+        let menu = screen(&mut app, 90, 24);
+        println!("{menu}\n");
+        for entry in [
+            "Actions",
+            "Hide this course",
+            "Show hidden courses",
+            "Refresh from Canvas",
+            "Keys and help",
+            "Quit",
+        ] {
+            assert!(menu.contains(entry), "{entry} missing:\n{menu}");
+        }
+        // Search narrows the entries; Enter runs the chosen one.
+        send(&mut app, KeyCode::Char('/'));
+        for c in "refr".chars() {
+            send(&mut app, KeyCode::Char(c));
+        }
+        let narrowed = screen(&mut app, 90, 24);
+        assert!(
+            narrowed.contains("Refresh from Canvas") && !narrowed.contains("Quit"),
+            "{narrowed}"
+        );
+        let effects = send(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &effects[..],
+            [crate::app::Effect::Fetch {
+                key: ResourceKey::Courses,
+                ..
+            }]
+        ));
+        assert!(app.menu.is_none());
+        // `?` lists the keys of this screen and the menu-only actions.
+        send(&mut app, KeyCode::Char('?'));
+        let help = screen(&mut app, 90, 30);
+        println!("{help}\n");
+        assert!(
+            help.contains("Keys on this screen")
+                && help.contains("Space")
+                && help.contains("In the actions menu"),
+            "{help}"
+        );
+        send(&mut app, KeyCode::Esc);
+        assert!(app.help.is_none());
+        let footer = screen(&mut app, 80, 10);
+        assert!(
+            footer
+                .lines()
+                .last()
+                .unwrap()
+                .contains("Space actions  ? help"),
+            "{footer}"
+        );
     }
 
     /// Replays private saved responses without printing announcement contents.
@@ -2017,20 +2174,13 @@ mod tests {
                 }
                 let id = detail.base.id.clone();
                 let mut app = App::new(&config.origin, None);
-                app.stack.push(crate::app::View {
-                    kind: ViewKind::Announcement {
+                app.stack
+                    .push(crate::app::View::new(ViewKind::Announcement {
                         course_id: "1".into(),
                         course_name: "Course".into(),
                         announcement_id: id.clone(),
                         title: "Announcement".into(),
-                    },
-                    selected: 0,
-                    offset: 0,
-                    filter: String::new(),
-                    filtering: false,
-                    scroll: 0,
-                    link: None,
-                });
+                    }));
                 app.announcement_details.insert(
                     ("1".into(), id),
                     Resource {
@@ -2173,6 +2323,11 @@ mod tests {
                 due_at: Some(now + chrono::Duration::days(3)),
                 points_possible: Some(10.0),
                 submission_types: vec!["online_upload".into()],
+                submission: Some(Submission {
+                    submitted_at: Some(now),
+                    attempt: Some(2),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             description: Some("<p>Requirements are in the <a href=\"/courses/1/files/9/download\">Lab-2 slides</a>.</p><ul><li>Implement the kernel</li><li>Report timings</li></ul>".into()),
@@ -2184,11 +2339,24 @@ mod tests {
         assert!(
             s.contains("Due") && s.contains("Lab-2 slides") && s.contains("Implement the kernel")
         );
-        let effects = app.update(Msg::Key(KeyEvent::new(
-            KeyCode::Char('h'),
-            KeyModifiers::NONE,
-        )));
-        assert!(screen(&mut app, 100, 18).contains("Past submissions"));
+        // Past submissions are part of the page, read with it.
+        let effects: Vec<_> = app
+            .update(Msg::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+            )))
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::app::Effect::Fetch {
+                        key: ResourceKey::History(..),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(effects.len(), 1);
         let history = crate::submission::History::parse(serde_json::json!({
             "attempt": 2, "submitted_at": "2026-10-22T12:00:00Z",
             "submission_history": [
@@ -2197,11 +2365,19 @@ mod tests {
             ]
         })).unwrap();
         deliver(&mut app, effects, Payload::History(history));
+        // Tab, Tab: past the files & links to the submissions; ↓ chooses the older attempt.
+        for code in [KeyCode::Tab, KeyCode::Tab] {
+            app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
         let s = screen(&mut app, 100, 18);
-        assert!(s.contains("final.pdf") && s.contains("Attempt 2"));
-        app.update(Msg::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        println!("{s}\n");
+        assert!(
+            s.contains("Submissions (2)") && s.contains("final.pdf") && s.contains("Attempt 2"),
+            "{s}"
+        );
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         let s = screen(&mut app, 100, 18);
-        assert!(s.contains("First draft") && s.contains("Attempt 1"));
+        assert!(s.contains("First draft") && s.contains("Attempt 1"), "{s}");
         app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         // Refresh failure keeps content but marks it outdated.
         let effects = app.update(Msg::Key(KeyEvent::new(
@@ -2493,14 +2669,42 @@ mod preview {
             },
         });
         let tab = || Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let key = |c: char| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        // Past submissions are part of the page.
+        let history = crate::submission::History::parse(serde_json::json!({
+            "attempt": 2, "submitted_at": "2026-10-21T22:41:00Z", "workflow_state": "submitted",
+            "submission_history": [
+                {"attempt": 1, "submitted_at": "2026-10-20T15:02:00Z", "submission_type": "online_upload",
+                 "workflow_state": "submitted", "attachments": [{"display_name": "lab2-draft.zip", "size": 48200}]},
+                {"attempt": 2, "submitted_at": "2026-10-21T22:41:00Z", "submission_type": "online_upload",
+                 "workflow_state": "submitted", "attachments": [{"display_name": "lab2-final.zip", "size": 51900}]}
+            ]
+        }))
+        .unwrap();
+        app.histories.insert(
+            ("1".into(), "12".into()),
+            Resource {
+                data: Some(history),
+                origin: crate::app::Origin::Network,
+                fetched_at: Some(Utc::now()),
+                ..Default::default()
+            },
+        );
         app.notice = None;
         page += &html(&mut app, 104, 26);
         app.update(tab());
+        app.update(down());
+        page += &html(&mut app, 104, 26);
         app.update(tab());
         page += &html(&mut app, 104, 26);
+        app.update(key(' '));
+        page += &html(&mut app, 104, 26);
+        app.update(key('?'));
+        page += &html(&mut app, 104, 34);
 
         // The course's Files tab.
         let esc = || Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(esc());
         app.update(esc());
         app.update(esc());
         let effects = app.update(tab());
@@ -2573,6 +2777,8 @@ mod preview {
         });
         app.notice = None;
         page += &html(&mut app, 104, 12);
+        app.update(key(' '));
+        page += &html(&mut app, 104, 18);
         let _ = std::fs::remove_dir_all(&root);
         page += "</body></html>";
         std::fs::write(path, page).unwrap();

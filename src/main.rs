@@ -10,6 +10,7 @@ mod config;
 mod diag;
 mod download;
 mod html;
+mod keys;
 mod library;
 mod model;
 mod procstats;

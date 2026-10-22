@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::cache::{ResourceKey, SnapshotStore};
 use crate::canvas::{CanvasError, FetchStats};
 use crate::html::{Link, Target};
+use crate::keys::{self, Act, Scope};
 use crate::library::{self, Library, LocalState};
 use crate::model::{AssignmentDetail, AssignmentSummary, CanvasFile, CanvasFolder, Course};
 use crate::submission::{self, FileChoice};
@@ -211,6 +212,30 @@ pub struct SubmissionDraft {
     pub busy: bool,
 }
 
+/// What has focus on an assignment or announcement page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Section {
+    #[default]
+    Text,
+    Links,
+    Submissions,
+}
+
+/// The actions menu (`Space`).
+#[derive(Clone, Debug, Default)]
+pub struct MenuState {
+    pub selected: usize,
+    /// The search text, while searching.
+    pub search: Option<String>,
+}
+
+/// A screen showing one Canvas item with text, files and links.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Page {
+    Assignment(String, String),
+    Announcement(String, String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewKind {
     Courses,
@@ -242,6 +267,27 @@ pub enum ViewKind {
     },
 }
 
+impl ViewKind {
+    pub fn page(&self) -> Option<Page> {
+        match self {
+            ViewKind::Detail {
+                course_id,
+                assignment_id,
+                ..
+            } => Some(Page::Assignment(course_id.clone(), assignment_id.clone())),
+            ViewKind::Announcement {
+                course_id,
+                announcement_id,
+                ..
+            } => Some(Page::Announcement(
+                course_id.clone(),
+                announcement_id.clone(),
+            )),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct View {
     pub kind: ViewKind,
@@ -250,12 +296,18 @@ pub struct View {
     pub filter: String,
     pub filtering: bool,
     pub scroll: usize,
-    /// Selected entry in an assignment's files & links panel.
-    pub link: Option<usize>,
+    /// Focused section on a page.
+    pub focus: Section,
+    /// Selected entry in a page's files & links.
+    pub link: usize,
+    /// Selected attempt in an assignment's submissions (0 = latest).
+    pub attempt: usize,
+    /// Bring the focused section into view on the next draw.
+    pub reveal: bool,
 }
 
 impl View {
-    fn new(kind: ViewKind) -> Self {
+    pub fn new(kind: ViewKind) -> Self {
         View {
             kind,
             selected: 0,
@@ -263,7 +315,10 @@ impl View {
             filter: String::new(),
             filtering: false,
             scroll: 0,
-            link: None,
+            focus: Section::Text,
+            link: 0,
+            attempt: 0,
+            reveal: false,
         }
     }
 
@@ -314,13 +369,11 @@ pub struct App {
     pub announcement_render: Option<DetailRender>,
     announcement_reads: std::collections::BTreeSet<(String, String)>,
     pub hidden_courses: std::collections::BTreeSet<String>,
-    pub editing_home: bool,
+    /// Hidden courses are listed (marked) so they can be restored.
+    pub show_hidden: bool,
     pub assignments: HashMap<String, Resource<Vec<AssignmentSummary>>>,
     pub details: HashMap<(String, String), Resource<AssignmentDetail>>,
     pub histories: HashMap<(String, String), Resource<submission::History>>,
-    pub history_open: bool,
-    pub history_selected: usize,
-    pub history_scroll: usize,
     pub history_render: Option<HistoryRender>,
     pub stack: Vec<View>,
     next_request: u64,
@@ -346,6 +399,9 @@ pub struct App {
     pending: HashMap<String, Vec<Placement>>,
     pub library: Option<Arc<Library>>,
     pub submission: Option<SubmissionDraft>,
+    pub menu: Option<MenuState>,
+    /// The help screen, with its scroll position.
+    pub help: Option<usize>,
 }
 
 fn matches_filter(text: &str, filter: &str) -> bool {
@@ -399,13 +455,10 @@ impl App {
             announcement_render: None,
             announcement_reads,
             hidden_courses,
-            editing_home: false,
+            show_hidden: false,
             assignments: HashMap::new(),
             details: HashMap::new(),
             histories: HashMap::new(),
-            history_open: false,
-            history_selected: 0,
-            history_scroll: 0,
             history_render: None,
             stack: vec![View::new(ViewKind::Courses)],
             next_request: 0,
@@ -426,6 +479,8 @@ impl App {
             pending: HashMap::new(),
             library: None,
             submission: None,
+            menu: None,
+            help: None,
         }
     }
 
@@ -492,21 +547,10 @@ impl App {
     }
 
     pub fn current_syncing(&self) -> bool {
-        let key = if self.history_open {
-            if let ViewKind::Detail {
-                course_id,
-                assignment_id,
-                ..
-            } = &self.view().kind
-            {
-                ResourceKey::History(course_id.clone(), assignment_id.clone())
-            } else {
-                self.view().key()
-            }
-        } else {
-            self.view().key()
-        };
-        matches!(self.sync_of(&key), Some(SyncState::Syncing { .. }))
+        matches!(
+            self.sync_of(&self.view().key()),
+            Some(SyncState::Syncing { .. })
+        )
     }
 
     /// Show a saved copy (if any and nothing newer is loaded), then request fresh data.
@@ -515,7 +559,35 @@ impl App {
         self.load_snapshot(&key);
         self.mark_current_announcement_read();
         self.dirty = true;
-        self.request(key, explicit).into_iter().collect()
+        let mut effects: Vec<Effect> = self.request(key, explicit).into_iter().collect();
+        // Past submissions are part of the assignment page: read them with it
+        // when the copy on hand shows something was submitted.
+        if let ViewKind::Detail {
+            course_id,
+            assignment_id,
+            ..
+        } = self.view().kind.clone()
+            && self.was_submitted(&course_id, &assignment_id)
+        {
+            effects.extend(self.request(ResourceKey::History(course_id, assignment_id), explicit));
+        }
+        effects
+    }
+
+    /// Whether Canvas shows any submission for this assignment.
+    fn was_submitted(&self, course_id: &str, assignment_id: &str) -> bool {
+        self.details
+            .get(&(course_id.to_string(), assignment_id.to_string()))
+            .and_then(|r| r.data.as_ref())
+            .and_then(|d| d.base.submission.as_ref())
+            .is_some_and(|s| s.submitted_at.is_some() || s.attempt.unwrap_or(0) > 0)
+    }
+
+    pub fn attempt_count(&self, course_id: &str, assignment_id: &str) -> usize {
+        self.histories
+            .get(&(course_id.to_string(), assignment_id.to_string()))
+            .and_then(|r| r.data.as_ref())
+            .map_or(0, |h| h.attempts.len())
     }
 
     fn load_snapshot(&mut self, key: &ResourceKey) {
@@ -736,12 +808,7 @@ impl App {
             Ok((payload, stats)) => {
                 self.login_required = false;
                 self.applied.push(request);
-                if key == self.view().key()
-                    || (self.history_open
-                        && matches!(&key, ResourceKey::History(c, a)
-                            if matches!(&self.view().kind, ViewKind::Detail { course_id, assignment_id, .. }
-                                if c == course_id && a == assignment_id)))
-                {
+                if key == self.view().key() {
                     self.last_stats = Some((key.label(), stats));
                 }
                 let mut effects = Vec::new();
@@ -789,6 +856,11 @@ impl App {
                         r.sync = SyncState::Idle;
                         r.version += 1;
                         effects.extend(self.after_detail(c, a));
+                        if self.was_submitted(c, a) {
+                            effects.extend(
+                                self.request(ResourceKey::History(c.clone(), a.clone()), false),
+                            );
+                        }
                     }
                     (Payload::History(history), ResourceKey::History(c, a)) => {
                         let r = self.histories.entry((c.clone(), a.clone())).or_default();
@@ -798,8 +870,11 @@ impl App {
                         r.sync = SyncState::Idle;
                         r.version += 1;
                         let count = r.data.as_ref().map_or(0, |h| h.attempts.len());
-                        self.history_selected = self.history_selected.min(count.saturating_sub(1));
-                        self.history_scroll = 0;
+                        for view in &mut self.stack {
+                            if view.kind.page() == Some(Page::Assignment(c.clone(), a.clone())) {
+                                view.attempt = view.attempt.min(count.saturating_sub(1));
+                            }
+                        }
                     }
                     (Payload::Files(data), ResourceKey::Files(c)) => {
                         let r = self.course_files.entry(c.clone()).or_default();
@@ -866,7 +941,7 @@ impl App {
                 .unwrap_or(&[])
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| self.editing_home || !self.hidden_courses.contains(&c.id))
+                .filter(|(_, c)| self.show_hidden || !self.hidden_courses.contains(&c.id))
                 .filter(|(_, c)| {
                     matches_filter(c.title(), &view.filter)
                         || matches_filter(c.course_code.as_deref().unwrap_or(""), &view.filter)
@@ -1556,85 +1631,485 @@ impl App {
         vec![]
     }
 
-    fn open_history(&mut self, course: &str, assignment: &str) -> Vec<Effect> {
-        self.history_open = true;
-        self.history_selected = 0;
-        self.history_scroll = 0;
-        self.request(
-            ResourceKey::History(course.to_string(), assignment.to_string()),
-            true,
-        )
-        .into_iter()
-        .collect()
+    // ---- Keyboard ----
+    //
+    // Keys are looked up in `keys::BINDINGS` for the scopes active now, and the
+    // action they name is carried out here. Nothing below matches on raw keys
+    // except text typed into a text box.
+
+    /// The key scopes active now.
+    pub fn scopes(&self) -> Vec<Scope> {
+        if self.help.is_some() {
+            return vec![Scope::Help];
+        }
+        if let Some(menu) = &self.menu {
+            return vec![if menu.search.is_some() {
+                Scope::MenuSearch
+            } else {
+                Scope::Menu
+            }];
+        }
+        self.screen_scopes()
     }
 
-    fn on_history_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        let ViewKind::Detail {
-            course_id,
-            assignment_id,
-            ..
-        } = &self.view().kind
-        else {
-            self.history_open = false;
+    /// Scopes of the screen under any open menu or help.
+    pub fn screen_scopes(&self) -> Vec<Scope> {
+        if let Some(draft) = &self.submission {
+            return if draft.busy {
+                vec![]
+            } else if draft.reviewing {
+                vec![Scope::Review]
+            } else {
+                vec![Scope::PathInput]
+            };
+        }
+        let view = self.view();
+        if view.filtering {
+            return vec![Scope::Filter];
+        }
+        let mut scopes = vec![Scope::Screen];
+        if self.login_required {
+            scopes.push(Scope::SignedOut);
+        }
+        match &view.kind {
+            ViewKind::Courses => scopes.extend([Scope::List, Scope::Courses]),
+            ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => {
+                scopes.extend([Scope::List, Scope::CourseTabs])
+            }
+            ViewKind::Files { .. } => scopes.extend([Scope::List, Scope::CourseTabs, Scope::Files]),
+            ViewKind::Detail { .. } | ViewKind::Announcement { .. } => {
+                scopes.push(Scope::Page);
+                if matches!(view.kind, ViewKind::Detail { .. }) {
+                    scopes.push(Scope::Assignment);
+                }
+                if !self.current_links().is_empty() {
+                    scopes.push(Scope::HasLinks);
+                }
+                match self.focus() {
+                    Section::Links => scopes.push(Scope::Links),
+                    Section::Submissions => scopes.push(Scope::Submissions),
+                    Section::Text => {}
+                }
+            }
+        }
+        scopes
+    }
+
+    /// Sections the current page has, in order: text, files & links, submissions.
+    pub fn sections(&self) -> Vec<Section> {
+        let Some(page) = self.view().kind.page() else {
             return vec![];
         };
-        let (course_id, assignment_id) = (course_id.clone(), assignment_id.clone());
-        let count = self
-            .histories
-            .get(&(course_id.clone(), assignment_id.clone()))
-            .and_then(|r| r.data.as_ref())
-            .map_or(0, |h| h.attempts.len());
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('h') => self.history_open = false,
-            KeyCode::Left | KeyCode::BackTab => {
-                self.history_selected = self.history_selected.saturating_sub(1);
-                self.history_scroll = 0;
+        let mut out = vec![Section::Text];
+        if !self.page_links(&page).is_empty() {
+            out.push(Section::Links);
+        }
+        if let Page::Assignment(c, a) = &page
+            && self.attempt_count(c, a) > 0
+        {
+            out.push(Section::Submissions);
+        }
+        out
+    }
+
+    /// The focused section, falling back to the text if it went away.
+    pub fn focus(&self) -> Section {
+        let focus = self.view().focus;
+        if focus == Section::Text || self.sections().contains(&focus) {
+            focus
+        } else {
+            Section::Text
+        }
+    }
+
+    /// Files and links of the current page.
+    pub fn current_links(&self) -> Vec<Link> {
+        self.view()
+            .kind
+            .page()
+            .map(|p| self.page_links(&p))
+            .unwrap_or_default()
+    }
+
+    pub fn page_links(&self, page: &Page) -> Vec<Link> {
+        match page {
+            Page::Assignment(c, a) => self.links_of(c, a),
+            Page::Announcement(c, a) => self.announcement_links(c, a),
+        }
+    }
+
+    fn page_dir(&self, page: &Page) -> Option<PathBuf> {
+        match page {
+            Page::Assignment(c, a) => self.detail_dir(c, a),
+            Page::Announcement(c, a) => self.announcement_dir(c, a),
+        }
+    }
+
+    /// The selected entry of the files & links section, while it has focus.
+    pub fn selected_link(&self) -> Option<Link> {
+        if self.focus() != Section::Links {
+            return None;
+        }
+        self.current_links().get(self.view().link).cloned()
+    }
+
+    /// Whether an action does something here (for the hint line and the menu).
+    pub fn available(&self, act: Act) -> bool {
+        if self.help.is_some()
+            || self.menu.is_some()
+            || self.submission.is_some()
+            || self.view().filtering
+        {
+            return true;
+        }
+        self.screen_available(act)
+    }
+
+    fn screen_available(&self, act: Act) -> bool {
+        let page = self.view().kind.page();
+        match act {
+            Act::Open => match page {
+                Some(_) => self.focus() == Section::Links,
+                None => !self.visible_rows().is_empty(),
+            },
+            Act::Download => match self.view().kind {
+                ViewKind::Files { .. } => !self.file_rows().is_empty(),
+                _ => matches!(
+                    self.selected_link().map(|l| l.target),
+                    Some(Target::File { .. })
+                ),
+            },
+            Act::DownloadAll => match self.view().kind {
+                ViewKind::Files { .. } => !self.file_rows().is_empty(),
+                _ => self
+                    .current_links()
+                    .iter()
+                    .any(|l| matches!(l.target, Target::File { .. })),
+            },
+            Act::ShowFolder | Act::OpenLibrary => self.library.is_some(),
+            Act::Submit => match &self.view().kind {
+                ViewKind::Detail {
+                    course_id,
+                    assignment_id,
+                    ..
+                } => self
+                    .details
+                    .get(&(course_id.clone(), assignment_id.clone()))
+                    .and_then(|r| r.data.as_ref())
+                    .is_some_and(|d| d.base.submission_types.iter().any(|t| t == "online_upload")),
+                _ => false,
+            },
+            Act::NextSection | Act::PrevSection => page.is_none() || self.sections().len() > 1,
+            Act::HideCourse => !self.visible_rows().is_empty(),
+            Act::Search => self.is_list(),
+            _ => true,
+        }
+    }
+
+    /// The actions menu's entries for the screen under it, filtered by its search.
+    pub fn menu_entries(&self) -> Vec<&'static keys::Binding> {
+        let scopes = self.screen_scopes();
+        let search = self
+            .menu
+            .as_ref()
+            .and_then(|m| m.search.as_deref())
+            .unwrap_or("")
+            .to_lowercase();
+        keys::menu(&scopes, &|a| self.screen_available(a))
+            .into_iter()
+            .filter(|b| search.is_empty() || self.title_of(b).to_lowercase().contains(&search))
+            .collect()
+    }
+
+    /// An action's name in the menu and help, adjusted to what is selected.
+    pub fn title_of(&self, binding: &keys::Binding) -> String {
+        match binding.act {
+            Act::HideCourse => {
+                let hidden = self
+                    .visible_rows()
+                    .get(self.view().selected)
+                    .and_then(|&i| self.courses.data.as_ref()?.get(i))
+                    .is_some_and(|c| self.hidden_courses.contains(&c.id));
+                if hidden {
+                    "Restore this course"
+                } else {
+                    "Hide this course"
+                }
+                .into()
             }
-            KeyCode::Right | KeyCode::Tab => {
-                self.history_selected = (self.history_selected + 1).min(count.saturating_sub(1));
-                self.history_scroll = 0;
+            Act::ShowHidden if self.show_hidden => "Stop showing hidden courses".into(),
+            Act::ShowHidden => "Show hidden courses".into(),
+            _ => binding.title.into(),
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return vec![];
+        }
+        let scopes = self.scopes();
+        if let Some(binding) = keys::lookup(keys::key_of(&key), &scopes) {
+            return self.perform(binding.act, &key);
+        }
+        if keys::typing(&scopes) {
+            self.type_text(&key);
+            return vec![];
+        }
+        // Letters in the actions menu run the entry they label.
+        if scopes.contains(&Scope::Menu)
+            && let KeyCode::Char(c) = key.code
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let Some(entry) = self.menu_entries().into_iter().find(|e| e.menu == Some(c))
+        {
+            self.menu = None;
+            return self.perform(entry.act, &key);
+        }
+        vec![]
+    }
+
+    /// Text typed into the search box, the menu's search, or a file path.
+    fn type_text(&mut self, key: &KeyEvent) {
+        let typed = match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(c)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.history_scroll = self.history_scroll.saturating_sub(1);
+            _ => None,
+        };
+        let erase = key.code == KeyCode::Backspace;
+        if let Some(menu) = &mut self.menu {
+            let search = menu.search.get_or_insert_with(String::new);
+            if erase {
+                search.pop();
+            } else if let Some(c) = typed
+                && search.chars().count() < 40
+            {
+                search.push(c);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.history_scroll = self.history_scroll.saturating_add(1)
+            menu.selected = 0;
+            return;
+        }
+        if let Some(draft) = &mut self.submission {
+            // A held Backspace would wipe the path; one character per press.
+            if erase && key.kind != KeyEventKind::Repeat {
+                draft.input.pop();
+            } else if let Some(c) = typed
+                && draft.input.chars().count() < 1024
+            {
+                draft.input.push(c);
+            } else {
+                return;
             }
-            KeyCode::PageUp => {
-                self.history_scroll = self.history_scroll.saturating_sub(self.page());
+            draft.suggestions.update(&draft.input);
+            return;
+        }
+        let view = self.view_mut();
+        if erase {
+            view.filter.pop();
+        } else if let Some(c) = typed
+            && view.filter.chars().count() < 64
+        {
+            view.filter.push(c);
+        } else {
+            return;
+        }
+        view.selected = 0;
+    }
+
+    /// Carry out an action.
+    fn perform(&mut self, act: Act, key: &KeyEvent) -> Vec<Effect> {
+        if self.help.is_some() {
+            return self.help_act(act);
+        }
+        if self.menu.is_some() {
+            return self.menu_act(act);
+        }
+        if self.submission.is_some() {
+            return self.submission_act(act);
+        }
+        if self.view().filtering {
+            return self.filter_act(act);
+        }
+        let page = self.view().kind.page();
+        match act {
+            Act::Quit => {
+                self.quit = true;
+                vec![]
             }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.history_scroll = self.history_scroll.saturating_add(self.page())
+            Act::Up | Act::Down | Act::PageUp | Act::PageDown | Act::Top | Act::Bottom => {
+                self.navigate(act);
+                vec![]
             }
-            KeyCode::Home | KeyCode::Char('g') => self.history_scroll = 0,
-            KeyCode::Char('r') => {
-                return self
-                    .request(ResourceKey::History(course_id, assignment_id), true)
-                    .into_iter()
-                    .collect();
+            Act::Open => match &page {
+                Some(page) => self.open_link(page),
+                None => self.open_selected(),
+            },
+            Act::Back => self.go_back(),
+            Act::NextSection | Act::PrevSection => {
+                let forward = act == Act::NextSection;
+                if page.is_some() {
+                    self.cycle_section(forward);
+                    vec![]
+                } else {
+                    self.switch_tab(!forward)
+                }
+            }
+            Act::Search => {
+                if self.is_list() {
+                    self.view_mut().filtering = true;
+                }
+                vec![]
+            }
+            Act::Refresh => self.refresh(),
+            Act::Browser => self
+                .browser_url()
+                .map(Effect::OpenUrl)
+                .into_iter()
+                .collect(),
+            Act::Menu => {
+                self.menu = Some(MenuState::default());
+                vec![]
+            }
+            Act::Help => {
+                self.help = Some(0);
+                vec![]
+            }
+            Act::Download => self.download_selected(),
+            Act::DownloadAll => self.download_everything(),
+            Act::ShowFolder => self.show_folder(),
+            Act::Submit => match self.view().kind.clone() {
+                ViewKind::Detail {
+                    course_id,
+                    assignment_id,
+                    ..
+                } => self.start_submission(&course_id, &assignment_id),
+                _ => vec![],
+            },
+            Act::JumpToLink => {
+                if let KeyCode::Char(c) = key.code
+                    && let Some(n) = c.to_digit(10)
+                {
+                    self.jump_to_link(n as usize);
+                }
+                vec![]
+            }
+            Act::HideCourse => {
+                self.toggle_selected_course_hidden();
+                vec![]
+            }
+            Act::ShowHidden => {
+                self.show_hidden = !self.show_hidden;
+                self.notice = Some(if self.show_hidden {
+                    "Showing hidden courses. Select one, then Space h to restore it.".into()
+                } else {
+                    "Hidden courses are hidden again.".into()
+                });
+                self.clamp_selection();
+                vec![]
+            }
+            Act::OpenLibrary => {
+                let root = self.library.as_ref().map(|l| l.root().to_path_buf());
+                self.reveal(root)
+            }
+            Act::SignIn => vec![Effect::Login],
+            Act::InputDone
+            | Act::InputCancel
+            | Act::InputComplete
+            | Act::InputClear
+            | Act::Confirm => vec![],
+        }
+    }
+
+    fn help_act(&mut self, act: Act) -> Vec<Effect> {
+        let page = self.page();
+        let Some(scroll) = self.help.as_mut() else {
+            return vec![];
+        };
+        match act {
+            Act::Up => *scroll = scroll.saturating_sub(1),
+            Act::Down => *scroll += 1,
+            Act::PageUp => *scroll = scroll.saturating_sub(page),
+            Act::PageDown => *scroll += page,
+            Act::Top => *scroll = 0,
+            Act::Bottom => *scroll = usize::MAX / 2,
+            Act::Back | Act::Help => self.help = None,
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn menu_act(&mut self, act: Act) -> Vec<Effect> {
+        let count = self.menu_entries().len();
+        let Some(menu) = self.menu.as_mut() else {
+            return vec![];
+        };
+        match act {
+            Act::Up => menu.selected = menu.selected.saturating_sub(1),
+            Act::Down => menu.selected = (menu.selected + 1).min(count.saturating_sub(1)),
+            Act::Search => menu.search = Some(String::new()),
+            Act::InputCancel => {
+                menu.search = None;
+                menu.selected = 0;
+            }
+            Act::Back | Act::Menu => self.menu = None,
+            Act::Help => {
+                self.menu = None;
+                self.help = Some(0);
+            }
+            Act::Open => {
+                let selected = menu.selected;
+                let chosen = self.menu_entries().get(selected).map(|e| e.act);
+                self.menu = None;
+                if let Some(act) = chosen {
+                    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                    return self.perform(act, &enter);
+                }
             }
             _ => {}
         }
         vec![]
     }
 
-    fn on_submission_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+    fn filter_act(&mut self, act: Act) -> Vec<Effect> {
+        match act {
+            Act::InputDone => self.view_mut().filtering = false,
+            Act::InputCancel => {
+                let v = self.view_mut();
+                v.filter.clear();
+                v.filtering = false;
+                v.selected = 0;
+            }
+            Act::Up => self.move_selection(-1),
+            Act::Down => self.move_selection(1),
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn submission_act(&mut self, act: Act) -> Vec<Effect> {
         let kind = self.view().kind.clone();
-        let draft = self.submission.as_mut().expect("checked above");
+        let draft = self.submission.as_mut().expect("checked by the caller");
         if draft.busy {
             return vec![];
         }
         if draft.reviewing {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('n') => draft.reviewing = false,
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    draft.busy = true;
+            match act {
+                Act::InputCancel => draft.reviewing = false,
+                Act::Confirm => {
                     if let ViewKind::Detail {
                         course_id,
                         assignment_id,
                         ..
                     } = &kind
                     {
+                        draft.busy = true;
                         return vec![Effect::Submit {
                             course_id: course_id.clone(),
                             assignment_id: assignment_id.clone(),
@@ -1646,25 +2121,21 @@ impl App {
             }
             return vec![];
         }
-        match key.code {
-            KeyCode::Esc => self.submission = None,
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        match act {
+            Act::InputCancel => self.submission = None,
+            Act::InputClear => {
                 draft.input.clear();
                 draft.suggestions.update(&draft.input);
             }
-            KeyCode::Backspace if key.kind != KeyEventKind::Repeat => {
-                draft.input.pop();
-                draft.suggestions.update(&draft.input);
-            }
-            KeyCode::Up | KeyCode::BackTab => draft.suggestions.move_selection(-1),
-            KeyCode::Down => draft.suggestions.move_selection(1),
-            KeyCode::Tab => {
+            Act::Up => draft.suggestions.move_selection(-1),
+            Act::Down => draft.suggestions.move_selection(1),
+            Act::InputComplete => {
                 if let Some(path) = draft.suggestions.complete() {
                     draft.input = path;
                     draft.suggestions.update(&draft.input);
                 }
             }
-            KeyCode::Enter => {
+            Act::InputDone => {
                 if draft.input.trim().is_empty() || draft.input == draft.start_directory {
                     if draft.files.is_empty() {
                         self.notice = Some("Add a file path first.".into());
@@ -1676,135 +2147,110 @@ impl App {
                     assignment_id,
                     ..
                 } = &kind
-                {
-                    if let Some(detail) = self
+                    && let Some(detail) = self
                         .details
                         .get(&(course_id.clone(), assignment_id.clone()))
                         .and_then(|r| r.data.as_ref())
-                    {
-                        match submission::choose_file(&draft.input, detail, &draft.files) {
-                            Ok(file) => {
-                                draft.files.push(file);
-                                draft.input = draft.start_directory.clone();
-                                draft.suggestions.update(&draft.input);
-                            }
-                            Err(reason) => self.notice = Some(reason),
+                {
+                    match submission::choose_file(&draft.input, detail, &draft.files) {
+                        Ok(file) => {
+                            draft.files.push(file);
+                            draft.input = draft.start_directory.clone();
+                            draft.suggestions.update(&draft.input);
                         }
+                        Err(reason) => self.notice = Some(reason),
                     }
                 }
-            }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && draft.input.chars().count() < 1024 =>
-            {
-                draft.input.push(c);
-                draft.suggestions.update(&draft.input);
             }
             _ => {}
         }
         vec![]
     }
 
-    fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return vec![];
-        }
-        if self.submission.is_some() {
-            return self.on_submission_key(key);
-        }
-        if self.history_open {
-            return self.on_history_key(key);
-        }
+    /// Moving: rows in a list, lines of a page's text, or the entries of its
+    /// focused section.
+    fn navigate(&mut self, act: Act) {
         let page = self.page() as isize;
-        if self.view().filtering {
-            match key.code {
-                KeyCode::Esc => {
-                    let v = self.view_mut();
-                    v.filter.clear();
-                    v.filtering = false;
-                    v.selected = 0;
-                }
-                KeyCode::Enter => self.view_mut().filtering = false,
-                KeyCode::Backspace => {
-                    let v = self.view_mut();
-                    v.filter.pop();
-                    v.selected = 0;
-                }
-                KeyCode::Up => self.move_selection(-1),
-                KeyCode::Down => self.move_selection(1),
-                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                    let v = self.view_mut();
-                    if v.filter.chars().count() < 64 {
-                        v.filter.push(c);
-                    }
-                    v.selected = 0;
-                }
-                _ => {}
-            }
+        let delta = match act {
+            Act::Up => -1,
+            Act::Down => 1,
+            Act::PageUp => -page,
+            Act::PageDown => page,
+            Act::Top => isize::MIN / 2,
+            _ => isize::MAX / 2,
+        };
+        if self.is_list() {
+            self.move_selection(delta);
+            return;
+        }
+        let count = match (self.focus(), self.view().kind.page()) {
+            (Section::Links, _) => self.current_links().len(),
+            (Section::Submissions, Some(Page::Assignment(c, a))) => self.attempt_count(&c, &a),
+            _ => 0,
+        };
+        let focus = self.focus();
+        let view = self.view_mut();
+        let step =
+            |at: usize| (at as isize + delta).clamp(0, count.saturating_sub(1) as isize) as usize;
+        match focus {
+            Section::Text => view.scroll = (view.scroll as isize + delta).max(0) as usize,
+            Section::Links => view.link = step(view.link),
+            Section::Submissions => view.attempt = step(view.attempt),
+        }
+    }
+
+    /// Next or previous section of a page; the text is always first.
+    fn cycle_section(&mut self, forward: bool) {
+        let sections = self.sections();
+        if sections.len() < 2 {
+            return;
+        }
+        let at = sections
+            .iter()
+            .position(|s| *s == self.focus())
+            .unwrap_or(0);
+        let n = sections.len();
+        let next = sections[if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        }];
+        let links = self.current_links().len();
+        let view = self.view_mut();
+        view.focus = next;
+        view.reveal = next != Section::Text;
+        if view.link >= links {
+            view.link = 0;
+        }
+    }
+
+    fn jump_to_link(&mut self, n: usize) {
+        if n >= 1 && n <= self.current_links().len() {
+            let view = self.view_mut();
+            view.focus = Section::Links;
+            view.link = n - 1;
+            view.reveal = true;
+        }
+    }
+
+    /// `Esc`: clear a search, leave a section, stop showing hidden courses, or go back.
+    fn go_back(&mut self) -> Vec<Effect> {
+        if !self.view().filter.is_empty() {
+            let v = self.view_mut();
+            v.filter.clear();
+            v.selected = 0;
             return vec![];
         }
-        if let Some(effects) = self.on_view_key(key) {
-            return effects;
+        if self.view().kind.page().is_some() && self.view().focus != Section::Text {
+            self.view_mut().focus = Section::Text;
+            return vec![];
         }
-        match key.code {
-            KeyCode::Char('q') => {
-                self.quit = true;
-                vec![]
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                vec![]
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
-                vec![]
-            }
-            KeyCode::PageUp => {
-                self.move_selection(-page);
-                vec![]
-            }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.move_selection(page);
-                vec![]
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.move_selection(isize::MIN / 2);
-                vec![]
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                self.move_selection(isize::MAX / 2);
-                vec![]
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                if !self.view().filter.is_empty() {
-                    let v = self.view_mut();
-                    v.filter.clear();
-                    v.selected = 0;
-                    return vec![];
-                }
-                self.back()
-            }
-            KeyCode::Char('/') if self.is_list() => {
-                self.view_mut().filtering = true;
-                vec![]
-            }
-            KeyCode::Char('r') => {
-                let key = self.view().key();
-                self.request(key, true).into_iter().collect()
-            }
-            KeyCode::Char('o') => self
-                .browser_url()
-                .map(Effect::OpenUrl)
-                .into_iter()
-                .collect(),
-            KeyCode::Char('L') => vec![Effect::Login],
-            _ => vec![],
+        if self.view().kind == ViewKind::Courses && self.show_hidden {
+            self.show_hidden = false;
+            self.clamp_selection();
+            return vec![];
         }
+        self.back()
     }
 
     fn back(&mut self) -> Vec<Effect> {
@@ -1824,265 +2270,163 @@ impl App {
         self.enter_current(false)
     }
 
-    /// Keys that only some views use. `None` falls through to the shared keys.
-    fn on_view_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
-        let kind = self.view().kind.clone();
-        match kind {
-            ViewKind::Assignments { .. } | ViewKind::Announcements { .. } => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    Some(self.switch_tab(key.code == KeyCode::BackTab))
+    /// `r`: read this screen again now (and an assignment's past submissions).
+    fn refresh(&mut self) -> Vec<Effect> {
+        let key = self.view().key();
+        let mut effects: Vec<Effect> = self.request(key, true).into_iter().collect();
+        if let ViewKind::Detail {
+            course_id,
+            assignment_id,
+            ..
+        } = self.view().kind.clone()
+            && (self.was_submitted(&course_id, &assignment_id)
+                || self
+                    .histories
+                    .contains_key(&(course_id.clone(), assignment_id.clone())))
+        {
+            effects.extend(self.request(ResourceKey::History(course_id, assignment_id), true));
+        }
+        effects
+    }
+
+    /// `Enter` on a page: open the selected file or link.
+    fn open_link(&mut self, page: &Page) -> Vec<Effect> {
+        let Some(link) = self.selected_link() else {
+            return vec![];
+        };
+        match page {
+            Page::Assignment(c, a) => self.activate_link(c, a, link),
+            Page::Announcement(c, a) => self.activate_announcement_link(c, a, link),
+        }
+    }
+
+    /// `d`: download the selected file (or, in Files, folder).
+    fn download_selected(&mut self) -> Vec<Effect> {
+        if let ViewKind::Files {
+            course_id,
+            course_name,
+            ..
+        } = self.view().kind.clone()
+        {
+            let rows = self.file_rows();
+            return match rows.get(self.view().selected).copied() {
+                Some(FileRow::File(f)) => {
+                    let id = f.id.clone();
+                    let dir = self.file_dir(&course_id, &course_name, f);
+                    self.place_from(&id, dir, false)
                 }
+                Some(FileRow::Folder(f)) => {
+                    let id = f.id.clone();
+                    self.download_folder(&course_id, &course_name, Some(&id))
+                }
+                None => vec![],
+            };
+        }
+        let Some(page) = self.view().kind.page() else {
+            return vec![];
+        };
+        match self.selected_link().map(|l| l.target) {
+            Some(Target::File { id }) => {
+                let dir = self.page_dir(&page);
+                match page {
+                    Page::Assignment(..) => self.place_from(&id, dir, false),
+                    Page::Announcement(..) => self.place_announcement_file(&id, dir, false),
+                }
+            }
+            Some(_) => {
+                self.notice = Some("That link is not a file.".into());
+                vec![]
+            }
+            None => {
+                self.notice = Some("Choose a file first: Tab to the files & links.".into());
+                vec![]
+            }
+        }
+    }
+
+    /// `D`: download every file in this folder, or every file of this page.
+    fn download_everything(&mut self) -> Vec<Effect> {
+        if let ViewKind::Files {
+            course_id,
+            course_name,
+            folder_id,
+        } = self.view().kind.clone()
+        {
+            return self.download_folder(&course_id, &course_name, folder_id.as_deref());
+        }
+        let Some(page) = self.view().kind.page() else {
+            return vec![];
+        };
+        let ids: Vec<String> = self
+            .page_links(&page)
+            .iter()
+            .filter_map(|l| match &l.target {
+                Target::File { id } => Some(id.clone()),
                 _ => None,
-            },
+            })
+            .collect();
+        if ids.is_empty() {
+            self.notice = Some("There are no files here.".into());
+            return vec![];
+        }
+        let Some(dir) = self.page_dir(&page) else {
+            self.notice = Some("The file library is unavailable.".into());
+            return vec![];
+        };
+        match page {
+            Page::Assignment(..) => {
+                let batch = ids.into_iter().map(|id| (id, dir.clone())).collect();
+                self.download_batch(batch)
+            }
+            Page::Announcement(..) => {
+                let mut effects = Vec::new();
+                for id in ids {
+                    effects.extend(self.place_announcement_file(&id, Some(dir.clone()), false));
+                }
+                self.notice = Some("Checking files before downloading…".into());
+                effects
+            }
+        }
+    }
+
+    /// `e`: show the selected file, or this place's folder, in File Explorer.
+    fn show_folder(&mut self) -> Vec<Effect> {
+        let path = match self.view().kind.clone() {
+            ViewKind::Courses => {
+                let course = self
+                    .visible_rows()
+                    .get(self.view().selected)
+                    .and_then(|&i| self.courses.data.as_ref()?.get(i))
+                    .map(|c| (c.id.clone(), c.title().to_string()));
+                match (course, self.library.as_ref()) {
+                    (Some((id, title)), Some(lib)) => {
+                        Some(lib.root().join(self.course_dir(&id, &title)))
+                    }
+                    (None, Some(lib)) => Some(lib.root().to_path_buf()),
+                    _ => None,
+                }
+            }
             ViewKind::Files {
                 course_id,
                 course_name,
                 folder_id,
-            } => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    Some(self.switch_tab(key.code == KeyCode::BackTab))
-                }
-                KeyCode::Char('d') => {
-                    let rows = self.file_rows();
-                    let selected = rows.get(self.view().selected).copied();
-                    Some(match selected {
-                        Some(FileRow::File(f)) => {
-                            let id = f.id.clone();
-                            let dir = self.file_dir(&course_id, &course_name, f);
-                            self.place_from(&id, dir, false)
-                        }
-                        Some(FileRow::Folder(f)) => {
-                            let id = f.id.clone();
-                            self.download_folder(&course_id, &course_name, Some(&id))
-                        }
-                        None => vec![],
-                    })
-                }
-                KeyCode::Char('D') => {
-                    Some(self.download_folder(&course_id, &course_name, folder_id.as_deref()))
-                }
-                KeyCode::Char('e') => {
-                    let rows = self.file_rows();
-                    let saved = match rows.get(self.view().selected) {
-                        Some(FileRow::File(f)) => self.saved_path(&f.id),
-                        _ => None,
-                    };
-                    let path = saved
-                        .or_else(|| self.class_dir(&course_id, &course_name, folder_id.as_deref()));
-                    Some(self.reveal(path))
-                }
-                _ => None,
-            },
-            ViewKind::Announcement {
-                course_id,
-                announcement_id,
-                ..
             } => {
-                let links = self.announcement_links(&course_id, &announcement_id);
-                let selected = self.view().link.filter(|&i| i < links.len());
-                match key.code {
-                    KeyCode::Tab | KeyCode::BackTab if !links.is_empty() => {
-                        let n = links.len();
-                        let next = match (selected, key.code) {
-                            (None, KeyCode::BackTab) => n - 1,
-                            (None, _) => 0,
-                            (Some(i), KeyCode::BackTab) => (i + n - 1) % n,
-                            (Some(i), _) => (i + 1) % n,
-                        };
-                        self.view_mut().link = Some(next);
-                        Some(vec![])
-                    }
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let i = c as usize - '1' as usize;
-                        if i < links.len() {
-                            self.view_mut().link = Some(i);
-                        }
-                        Some(vec![])
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Some(match selected {
-                        Some(i) => self.activate_announcement_link(
-                            &course_id,
-                            &announcement_id,
-                            links[i].clone(),
-                        ),
-                        None => vec![],
-                    }),
-                    KeyCode::Esc if selected.is_some() => {
-                        self.view_mut().link = None;
-                        Some(vec![])
-                    }
-                    KeyCode::Char('d') => Some(match selected.map(|i| &links[i].target) {
-                        Some(Target::File { id }) => {
-                            let id = id.clone();
-                            let dir = self.announcement_dir(&course_id, &announcement_id);
-                            self.place_announcement_file(&id, dir, false)
-                        }
-                        Some(_) => {
-                            self.notice = Some("That link is not a file.".into());
-                            vec![]
-                        }
-                        None => {
-                            self.notice = Some(
-                                "Select a file with Tab first, or press D for all files.".into(),
-                            );
-                            vec![]
-                        }
-                    }),
-                    KeyCode::Char('D') => {
-                        let dir = self.announcement_dir(&course_id, &announcement_id);
-                        let ids: Vec<String> = links
-                            .iter()
-                            .filter_map(|l| match &l.target {
-                                Target::File { id } => Some(id.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        if ids.is_empty() {
-                            self.notice = Some("This announcement has no files.".into());
-                            return Some(vec![]);
-                        }
-                        let Some(dir) = dir else {
-                            self.notice = Some("The file library is unavailable.".into());
-                            return Some(vec![]);
-                        };
-                        let mut effects = Vec::new();
-                        for id in ids {
-                            effects.extend(self.place_announcement_file(
-                                &id,
-                                Some(dir.clone()),
-                                false,
-                            ));
-                        }
-                        self.notice = Some("Checking files before downloading…".into());
-                        Some(effects)
-                    }
-                    KeyCode::Char('e') => {
-                        let saved = match selected.map(|i| &links[i].target) {
-                            Some(Target::File { id }) => self.saved_path(id),
-                            _ => None,
-                        };
-                        let path =
-                            saved.or_else(|| self.announcement_dir(&course_id, &announcement_id));
-                        Some(self.reveal(path))
-                    }
+                let rows = self.file_rows();
+                let saved = match rows.get(self.view().selected) {
+                    Some(FileRow::File(f)) => self.saved_path(&f.id),
                     _ => None,
-                }
+                };
+                saved.or_else(|| self.class_dir(&course_id, &course_name, folder_id.as_deref()))
             }
-            ViewKind::Detail {
-                course_id,
-                assignment_id,
-                ..
-            } => {
-                if key.code == KeyCode::Char('h') {
-                    return Some(self.open_history(&course_id, &assignment_id));
-                }
-                if key.code == KeyCode::Char('s') {
-                    return Some(self.start_submission(&course_id, &assignment_id));
-                }
-                let links = self.links_of(&course_id, &assignment_id);
-                let selected = self.view().link.filter(|&i| i < links.len());
-                match key.code {
-                    KeyCode::Tab | KeyCode::BackTab if !links.is_empty() => {
-                        let n = links.len();
-                        let next = match (selected, key.code) {
-                            (None, KeyCode::BackTab) => n - 1,
-                            (None, _) => 0,
-                            (Some(i), KeyCode::BackTab) => (i + n - 1) % n,
-                            (Some(i), _) => (i + 1) % n,
-                        };
-                        self.view_mut().link = Some(next);
-                        Some(vec![])
-                    }
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let i = c as usize - '1' as usize;
-                        if i < links.len() {
-                            self.view_mut().link = Some(i);
-                        }
-                        Some(vec![])
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Some(match selected {
-                        Some(i) => self.activate_link(&course_id, &assignment_id, links[i].clone()),
-                        None => vec![],
-                    }),
-                    KeyCode::Esc if selected.is_some() => {
-                        self.view_mut().link = None;
-                        Some(vec![])
-                    }
-                    KeyCode::Char('d') => Some(match selected.map(|i| &links[i].target) {
-                        Some(Target::File { id }) => {
-                            let id = id.clone();
-                            let dir = self.detail_dir(&course_id, &assignment_id);
-                            self.place_from(&id, dir, false)
-                        }
-                        Some(_) => {
-                            self.notice = Some("That link is not a file.".into());
-                            vec![]
-                        }
-                        None => {
-                            self.notice = Some(
-                                "Select a file with Tab first, or press D for all files.".into(),
-                            );
-                            vec![]
-                        }
-                    }),
-                    KeyCode::Char('D') => {
-                        let dir = self.detail_dir(&course_id, &assignment_id);
-                        let ids: Vec<String> = links
-                            .iter()
-                            .filter_map(|l| match &l.target {
-                                Target::File { id } => Some(id.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        if ids.is_empty() {
-                            self.notice = Some("This assignment has no files.".into());
-                            return Some(vec![]);
-                        }
-                        let Some(dir) = dir else {
-                            self.notice = Some("The file library is unavailable.".into());
-                            return Some(vec![]);
-                        };
-                        let batch = ids.into_iter().map(|id| (id, dir.clone())).collect();
-                        Some(self.download_batch(batch))
-                    }
-                    KeyCode::Char('e') => {
-                        let saved = match selected.map(|i| &links[i].target) {
-                            Some(Target::File { id }) => self.saved_path(id),
-                            _ => None,
-                        };
-                        let path = saved.or_else(|| self.detail_dir(&course_id, &assignment_id));
-                        Some(self.reveal(path))
-                    }
+            kind => {
+                let saved = match self.selected_link().map(|l| l.target) {
+                    Some(Target::File { id }) => self.saved_path(&id),
                     _ => None,
-                }
+                };
+                saved.or_else(|| kind.page().and_then(|p| self.page_dir(&p)))
             }
-            ViewKind::Courses => match key.code {
-                KeyCode::Char('E') => {
-                    self.editing_home = true;
-                    self.view_mut().selected = 0;
-                    self.view_mut().offset = 0;
-                    Some(vec![])
-                }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if self.editing_home => {
-                    self.toggle_selected_course_hidden();
-                    Some(vec![])
-                }
-                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
-                    if self.editing_home =>
-                {
-                    self.editing_home = false;
-                    self.view_mut().selected = 0;
-                    self.view_mut().offset = 0;
-                    self.clamp_selection();
-                    Some(vec![])
-                }
-                KeyCode::Char('e') => {
-                    let root = self.library.as_ref().map(|l| l.root().to_path_buf());
-                    Some(self.reveal(root))
-                }
-                _ => None,
-            },
-        }
+        };
+        self.reveal(path)
     }
 
     fn toggle_selected_course_hidden(&mut self) {
@@ -2403,11 +2747,8 @@ impl App {
                 announcement_id,
                 ..
             } => {
-                if let Some(i) = self.view().link {
-                    return self
-                        .announcement_links(course_id, announcement_id)
-                        .get(i)
-                        .map(|l| l.url.clone());
+                if let Some(link) = self.selected_link() {
+                    return Some(link.url);
                 }
                 Some(format!(
                     "{}/courses/{course_id}/discussion_topics/{announcement_id}",
@@ -2419,9 +2760,9 @@ impl App {
                 course_id,
                 assignment_id,
                 ..
-            } if self.view().link.is_some() => {
-                let links = self.links_of(course_id, assignment_id);
-                let link = links.get(self.view().link?)?;
+            } if self.selected_link().is_some() => {
+                let _ = (course_id, assignment_id);
+                let link = self.selected_link()?;
                 Some(match &link.target {
                     // The file's Canvas page rather than a direct download.
                     Target::File { id } => link.url.replacen(
@@ -2616,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn past_submissions_fetch_only_when_opened_and_refresh_each_visit() {
+    fn past_submissions_load_with_the_page_and_are_a_section_of_it() {
         let mut app = App::new("https://ufl.instructure.com", None);
         app.stack.push(View::new(ViewKind::Detail {
             course_id: "10".into(),
@@ -2624,10 +2965,24 @@ mod tests {
             assignment_id: "20".into(),
             title: "Lab".into(),
         }));
-        assert!(app.histories.is_empty());
-        let (key1, request1) = fetch_of(&app.update(key(KeyCode::Char('h'))));
+        let (k, r) = fetch_of(&app.enter_current(false));
+        let mut detail = AssignmentDetail::default();
+        detail.base.id = "20".into();
+        detail.base.submission = Some(crate::model::Submission {
+            submitted_at: Some(Utc::now()),
+            attempt: Some(2),
+            ..Default::default()
+        });
+        let effects = app.update(Msg::Fetched {
+            key: k,
+            request: r,
+            result: Ok((Payload::Detail(Box::new(detail)), FetchStats::default())),
+            at: Utc::now(),
+        });
+        // Something was submitted, so the attempts are read with the page.
+        let (key1, request1) = fetch_of(&effects);
         assert_eq!(key1, ResourceKey::History("10".into(), "20".into()));
-        assert!(app.history_open);
+        assert_eq!(app.sections(), vec![Section::Text], "no attempts known yet");
         let history = submission::History::parse(serde_json::json!({
             "attempt": 2, "submitted_at": "2026-10-22T12:00:00Z",
             "submission_history": [
@@ -2637,22 +2992,64 @@ mod tests {
         }))
         .unwrap();
         deliver(&mut app, key1, request1, Payload::History(history));
-        assert_eq!(
-            app.histories[&("10".into(), "20".into())]
-                .data
-                .as_ref()
-                .unwrap()
-                .attempts
-                .len(),
-            2
+        assert_eq!(app.attempt_count("10", "20"), 2);
+        assert_eq!(app.sections(), vec![Section::Text, Section::Submissions]);
+        // Tab moves to the attempts; arrows choose one; Esc returns to the text, then leaves.
+        assert!(app.update(key(KeyCode::Tab)).is_empty());
+        assert_eq!(app.focus(), Section::Submissions);
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.view().attempt, 1);
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.view().attempt, 1, "stays on the oldest");
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert_eq!(app.focus(), Section::Text);
+        assert_eq!(app.stack.len(), 2);
+        // `h` is "back" here too, as everywhere else.
+        app.update(key(KeyCode::Char('h')));
+        assert_eq!(app.stack.len(), 1);
+        // A new visit reads the attempts again, right away this time.
+        app.stack.push(View::new(ViewKind::Detail {
+            course_id: "10".into(),
+            course_name: "GPU".into(),
+            assignment_id: "20".into(),
+            title: "Lab".into(),
+        }));
+        let effects = app.enter_current(false);
+        let history_reads: Vec<u64> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Fetch {
+                    key: ResourceKey::History(..),
+                    request,
+                } => Some(*request),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(history_reads[..], [r] if r > request1),
+            "{effects:?}"
         );
-        app.update(key(KeyCode::Right));
-        assert_eq!(app.history_selected, 1);
-        app.update(key(KeyCode::Esc));
-        assert!(!app.history_open);
-        let (key2, request2) = fetch_of(&app.update(key(KeyCode::Char('h'))));
-        assert_eq!(key2, ResourceKey::History("10".into(), "20".into()));
-        assert!(request2 > request1);
+    }
+
+    #[test]
+    fn unsubmitted_assignments_do_not_read_past_submissions() {
+        let mut app = App::new("https://ufl.instructure.com", None);
+        app.stack.push(View::new(ViewKind::Detail {
+            course_id: "10".into(),
+            course_name: "GPU".into(),
+            assignment_id: "20".into(),
+            title: "Lab".into(),
+        }));
+        let (k, r) = fetch_of(&app.enter_current(false));
+        let effects = app.update(Msg::Fetched {
+            key: k,
+            request: r,
+            result: Ok((Payload::Detail(Box::default()), FetchStats::default())),
+            at: Utc::now(),
+        });
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.update(key(KeyCode::Tab)).is_empty());
+        assert_eq!(app.focus(), Section::Text, "nothing to move to");
     }
 
     #[test]
@@ -2668,11 +3065,11 @@ mod tests {
             r,
             Payload::Courses(vec![course("10", "GPU"), course("20", "Compilers")]),
         );
-        assert!(app.update(key(KeyCode::Char('E'))).is_empty());
-        assert!(app.editing_home);
-        assert!(app.update(key(KeyCode::Enter)).is_empty());
-        assert_eq!(app.visible_rows(), [0, 1]);
-        app.update(key(KeyCode::Esc));
+        // Space, then h: hide the selected course.
+        assert!(app.update(key(KeyCode::Char(' '))).is_empty());
+        assert!(app.menu.is_some());
+        assert!(app.update(key(KeyCode::Char('h'))).is_empty());
+        assert!(app.menu.is_none());
         assert_eq!(app.visible_rows(), [1]);
         let (k, r) = fetch_of(&app.update(key(KeyCode::Char('r'))));
         deliver(
@@ -2691,11 +3088,15 @@ mod tests {
             Payload::Courses(vec![course("10", "GPU"), course("20", "Compilers")]),
         );
         assert_eq!(restarted.visible_rows(), [1]);
-        restarted.update(key(KeyCode::Char('E')));
+        // Space, then H: show hidden courses; Space, then h on one restores it.
+        restarted.update(key(KeyCode::Char(' ')));
+        restarted.update(key(KeyCode::Char('H')));
         assert_eq!(restarted.visible_rows(), [0, 1]);
-        restarted.update(key(KeyCode::Enter));
+        restarted.update(key(KeyCode::Char(' ')));
+        restarted.update(key(KeyCode::Char('h')));
         assert!(restarted.hidden_courses.is_empty());
         restarted.update(key(KeyCode::Esc));
+        assert!(!restarted.show_hidden);
         assert_eq!(restarted.visible_rows(), [0, 1]);
         let other = App::new(
             "https://ufl.instructure.com",
@@ -2708,15 +3109,18 @@ mod tests {
     #[test]
     fn hiding_every_course_keeps_recovery_available() {
         let mut app = app_with_courses();
-        app.update(key(KeyCode::Char('E')));
-        app.update(key(KeyCode::Enter));
-        app.update(key(KeyCode::Down));
-        app.update(key(KeyCode::Enter));
-        app.update(key(KeyCode::Esc));
+        for _ in 0..2 {
+            app.update(key(KeyCode::Char(' ')));
+            app.update(key(KeyCode::Char('h')));
+        }
         assert!(app.visible_rows().is_empty());
-        app.update(key(KeyCode::Char('E')));
+        // The menu still offers a way back.
+        app.update(key(KeyCode::Char(' ')));
+        assert!(app.menu_entries().iter().any(|e| e.act == Act::ShowHidden));
+        app.update(key(KeyCode::Char('H')));
         assert_eq!(app.visible_rows(), [0, 1]);
-        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char(' ')));
+        app.update(key(KeyCode::Char('h')));
         assert_eq!(app.hidden_courses.len(), 1);
         app.update(key(KeyCode::Esc));
         assert_eq!(app.visible_rows(), [0]);
@@ -3460,9 +3864,10 @@ mod tests {
     fn links_list_selects_and_opens_each_kind() {
         let (lib, root) = temp_library("links");
         let mut app = detail_app(Some(lib), DESCRIPTION);
-        // Tab selects the first entry: the handout, whose details are still being read.
+        // Tab moves to the files & links; the handout's details are still being read.
         app.update(key(KeyCode::Tab));
-        assert_eq!(app.view().link, Some(0));
+        assert_eq!(app.focus(), Section::Links);
+        assert_eq!(app.view().link, 0);
         assert!(
             app.update(key(KeyCode::Enter)).is_empty(),
             "waits for the file's details"
@@ -3486,7 +3891,7 @@ mod tests {
             app.browser_url().unwrap(),
             format!("{ORIGIN}/courses/10/files/22?verifier=v")
         );
-        app.update(key(KeyCode::Tab));
+        app.update(key(KeyCode::Down));
         assert_eq!(
             app.update(key(KeyCode::Enter)),
             vec![Effect::OpenUrl("https://github.com/a/b".into())]
@@ -3496,11 +3901,13 @@ mod tests {
         let (k, _) = fetch_of(&app.update(key(KeyCode::Enter)));
         assert_eq!(k, ResourceKey::Detail("10".into(), "8".into()));
         assert!(matches!(&app.view().kind, ViewKind::Detail { title, .. } if title == "Lab-1"));
-        // Back again: Esc first clears the selection, then leaves.
+        // Back again: the list keeps its place; Esc returns to the text, then leaves.
         app.update(key(KeyCode::Esc));
-        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus(), Section::Links);
+        assert_eq!(app.view().link, 2);
         assert!(app.update(key(KeyCode::Esc)).is_empty());
-        assert_eq!(app.view().link, None);
+        assert_eq!(app.focus(), Section::Text);
+        assert_eq!(app.stack.len(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
